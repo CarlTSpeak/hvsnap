@@ -79,6 +79,7 @@ struct Options
     bool KeepFrozen = false;     // (snapshot) stay frozen after the dump instead of auto-thawing
     bool TerminateAfter = false; // (snapshot/freeze) terminate the target after the clean thaw
     bool Handoff = false;        // (snapshot) after the dump, hand off to a debugger at the RIP
+    bool NoExt3 = false;         // (snapshot) skip the v3 sidecar (snapshot.ext3.json)
     unsigned RingMb = 256;       // (trace) driver capture-ring size in MB
     int DurationSec = -1;        // (trace) seconds to trace (-1 = until Enter)
     unsigned long long MaxRecords = 0; // (trace) stop after N records (0 = unlimited)
@@ -121,6 +122,8 @@ void PrintUsage()
         L"                     auto-resuming; combine with --hold N to stay frozen N seconds.\n"
         L"  --terminate-after  after the snapshot and clean thaw, TERMINATE the target process\n"
         L"                     instead of letting it continue running.\n"
+        L"  --no-ext3          (snapshot) skip the v3 extended sidecar (snapshot.ext3.json); the\n"
+        L"                     v2 sidecar (snapshot.ext.json) is always written.\n"
         L"  --handoff          (snapshot) after the dump, hand off to a debugger AT the RIP\n"
         L"                     (removes the NPT trap, restores the RIP) -- snapshot + debug in one.\n"
         L"  --out FILE         (trace) output .bin path (default: trace.bin)\n"
@@ -400,6 +403,7 @@ int wmain(int argc, wchar_t** argv)
         else if (a == L"--cloak") { opt.Cloak = true; }
         else if (a == L"--keep-frozen") { opt.KeepFrozen = true; }
         else if (a == L"--terminate-after") { opt.TerminateAfter = true; }
+        else if (a == L"--no-ext3") { opt.NoExt3 = true; }
         else if (a == L"--handoff") { opt.Handoff = true; }
         else if (a == L"--ring-mb" && next(&v)) { opt.RingMb = (unsigned)wcstoul(v, nullptr, 0); }
         else if (a == L"--duration" && next(&v)) { opt.DurationSec = (int)wcstol(v, nullptr, 0); }
@@ -430,6 +434,8 @@ int wmain(int argc, wchar_t** argv)
     unsigned long long measuredSfMask = 0, measuredKernelGsBase = 0;
     unsigned long long measuredSysenterCs = 0, measuredSysenterEsp = 0, measuredSysenterEip = 0;
     unsigned long long measuredCpl = 0, measuredGPat = 0, measuredDbgCtl = 0;
+    Ext3DescriptorTables descriptorTables{};   // v3 tier (descriptor tables); .present stays
+                                              // false against a pre-v3 driver
     unsigned long long measuredTscGuest = 0, measuredTscAux = 0, measuredCr8 = 0;
     bool   haveMeasuredExtended = false;
 
@@ -723,8 +729,10 @@ int wmain(int argc, wchar_t** argv)
                 hit = true;
                 // Extended driver generations fill more of st; ret says how
                 // much actually fit. Every level degrades gracefully against
-                // an older driver (fields stay 0, provenance falls back).
-                if (ret >= sizeof(st))
+                // an older driver (fields stay 0, provenance falls back):
+                // the v2 tier (segment bases..CR8) needs HVSNAP_STATE_V2_SIZE
+                // bytes back, the v3 tier (descriptor tables) the full struct.
+                if (ret >= HVSNAP_STATE_V2_SIZE)
                 {
                     measuredFsBase = st.HitFsBase;
                     measuredGsBase = st.HitGsBase;
@@ -752,6 +760,22 @@ int wmain(int argc, wchar_t** argv)
                     measuredTscAux = st.HitTscAux;
                     measuredCr8 = st.HitCr8;
                     haveMeasuredExtended = true;
+                }
+                if (ret >= sizeof(st))
+                {
+                    descriptorTables.present = true;
+                    descriptorTables.gdtr_base = st.HitGdtrBase;
+                    descriptorTables.idtr_base = st.HitIdtrBase;
+                    descriptorTables.ldtr_base = st.HitLdtrBase;
+                    descriptorTables.tr_base = st.HitTrBase;
+                    descriptorTables.gdtr_limit = st.HitGdtrLimit;
+                    descriptorTables.idtr_limit = st.HitIdtrLimit;
+                    descriptorTables.ldtr_limit = st.HitLdtrLimit;
+                    descriptorTables.tr_limit = st.HitTrLimit;
+                    descriptorTables.ldtr_attrib = st.HitLdtrAttrib;
+                    descriptorTables.tr_attrib = st.HitTrAttrib;
+                    descriptorTables.ldtr_selector = st.HitLdtrSelector;
+                    descriptorTables.tr_selector = st.HitTrSelector;
                 }
                 break;
             }
@@ -806,7 +830,8 @@ int wmain(int argc, wchar_t** argv)
                                     measuredSysenterCs, measuredSysenterEsp, measuredSysenterEip,
                                     measuredCpl, measuredGPat, measuredDbgCtl,
                                     measuredTscGuest, measuredTscAux, measuredCr8,
-                                    haveMeasuredExtended);
+                                    haveMeasuredExtended, descriptorTables,
+                                    !opt.NoExt3);
             wprintf(L"[%s] Snapshot %s.\n", ok ? L"+" : L"!", ok ? L"complete" : L"FAILED");
         }
 

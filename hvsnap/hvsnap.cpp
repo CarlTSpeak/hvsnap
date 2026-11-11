@@ -497,6 +497,27 @@ typedef struct _HVSNAP_TARGET
     // the host DISPATCH_LEVEL CR8.
     //
     volatile UINT64 HitCr8;
+
+    //
+    // MEASURED descriptor-table registers of the same park event, from the
+    // VMCB state-save area (SVM carries the full descriptor cache, including
+    // the hidden LDTR/TR base/limit/attributes): what SGDT/SIDT/SLDT/STR
+    // would have returned had the target executed them at the frozen
+    // instruction. v3 tier - older controllers never receive these (QUERY
+    // gates on HVSNAP_STATE_V2_SIZE / sizeof(HVSNAP_STATE) independently).
+    //
+    volatile UINT64 HitGdtrBase;
+    volatile UINT64 HitIdtrBase;
+    volatile UINT64 HitLdtrBase;
+    volatile UINT64 HitTrBase;
+    volatile UINT32 HitGdtrLimit;
+    volatile UINT32 HitIdtrLimit;
+    volatile UINT32 HitLdtrLimit;
+    volatile UINT32 HitTrLimit;
+    volatile UINT32 HitLdtrAttrib;
+    volatile UINT32 HitTrAttrib;
+    volatile UINT16 HitLdtrSelector;
+    volatile UINT16 HitTrSelector;
 } HVSNAP_TARGET;
 
 static HVSNAP_TARGET g_Target;
@@ -980,6 +1001,23 @@ SvParkTargetThread (
         g_Target.HitGPat = VpData->GuestVmcb.StateSaveArea.GPat;
         g_Target.HitDbgCtl = VpData->GuestVmcb.StateSaveArea.DbgCtl;
         g_Target.HitCr8 = VpData->HostStackLayout.GuestCr8AtExit;
+        //
+        // v3 tier: descriptor-table registers (the VMCB keeps the full
+        // descriptor cache, so the hidden LDTR/TR fields are measured too,
+        // not just the architecturally visible selector/base/limit).
+        //
+        g_Target.HitGdtrBase = VpData->GuestVmcb.StateSaveArea.GdtrBase;
+        g_Target.HitIdtrBase = VpData->GuestVmcb.StateSaveArea.IdtrBase;
+        g_Target.HitLdtrBase = VpData->GuestVmcb.StateSaveArea.LdtrBase;
+        g_Target.HitTrBase = VpData->GuestVmcb.StateSaveArea.TrBase;
+        g_Target.HitGdtrLimit = VpData->GuestVmcb.StateSaveArea.GdtrLimit;
+        g_Target.HitIdtrLimit = VpData->GuestVmcb.StateSaveArea.IdtrLimit;
+        g_Target.HitLdtrLimit = VpData->GuestVmcb.StateSaveArea.LdtrLimit;
+        g_Target.HitTrLimit = VpData->GuestVmcb.StateSaveArea.TrLimit;
+        g_Target.HitLdtrAttrib = VpData->GuestVmcb.StateSaveArea.LdtrAttrib;
+        g_Target.HitTrAttrib = VpData->GuestVmcb.StateSaveArea.TrAttrib;
+        g_Target.HitLdtrSelector = VpData->GuestVmcb.StateSaveArea.LdtrSelector;
+        g_Target.HitTrSelector = VpData->GuestVmcb.StateSaveArea.TrSelector;
         //
         // Guest-VISIBLE TSC: the park host TSC minus the cycles the cloak has
         // already subtracted (what the target's next RDTSC would return).
@@ -1568,6 +1606,18 @@ SvArmNptTrap (
     g_Target.HitTscGuest = 0;
     g_Target.HitTscAux = 0;
     g_Target.HitCr8 = 0;
+    g_Target.HitGdtrBase = 0;
+    g_Target.HitIdtrBase = 0;
+    g_Target.HitLdtrBase = 0;
+    g_Target.HitTrBase = 0;
+    g_Target.HitGdtrLimit = 0;
+    g_Target.HitIdtrLimit = 0;
+    g_Target.HitLdtrLimit = 0;
+    g_Target.HitTrLimit = 0;
+    g_Target.HitLdtrAttrib = 0;
+    g_Target.HitTrAttrib = 0;
+    g_Target.HitLdtrSelector = 0;
+    g_Target.HitTrSelector = 0;
     InterlockedExchange64(&g_Target.ParkedCount, 0);
     InterlockedExchange64(&g_Target.MatchCount, 0);
     KeMemoryBarrier();
@@ -3423,9 +3473,12 @@ SvDispatchDeviceControl (
             //
             // Extended fields: filled progressively as the caller's buffer
             // allows (keeps every controller/driver generation combination
-            // working; the driver reports exactly what fit).
+            // working; the driver reports exactly what fit). The v2 tier is
+            // gated by HVSNAP_STATE_V2_SIZE (the size through HitCr8) so a
+            // v2 controller keeps receiving the v2 fields against a v3
+            // driver; the descriptor-table tier needs the full v3 struct.
             //
-            if (outLength >= sizeof(HVSNAP_STATE))
+            if (outLength >= HVSNAP_STATE_V2_SIZE)
             {
                 state->HitFsBase = static_cast<UINT64>(g_Target.HitFsBase);
                 state->HitGsBase = static_cast<UINT64>(g_Target.HitGsBase);
@@ -3450,7 +3503,24 @@ SvDispatchDeviceControl (
                 state->HitTscGuest = static_cast<UINT64>(g_Target.HitTscGuest);
                 state->HitTscAux = static_cast<UINT64>(g_Target.HitTscAux);
                 state->HitCr8 = static_cast<UINT64>(g_Target.HitCr8);
-                information = sizeof(HVSNAP_STATE);
+                information = HVSNAP_STATE_V2_SIZE;
+                if (outLength >= sizeof(HVSNAP_STATE))
+                {
+                    state->HitGdtrBase = static_cast<UINT64>(g_Target.HitGdtrBase);
+                    state->HitIdtrBase = static_cast<UINT64>(g_Target.HitIdtrBase);
+                    state->HitLdtrBase = static_cast<UINT64>(g_Target.HitLdtrBase);
+                    state->HitTrBase = static_cast<UINT64>(g_Target.HitTrBase);
+                    state->HitGdtrLimit = static_cast<UINT32>(g_Target.HitGdtrLimit);
+                    state->HitIdtrLimit = static_cast<UINT32>(g_Target.HitIdtrLimit);
+                    state->HitLdtrLimit = static_cast<UINT32>(g_Target.HitLdtrLimit);
+                    state->HitTrLimit = static_cast<UINT32>(g_Target.HitTrLimit);
+                    state->HitLdtrAttrib = static_cast<UINT32>(g_Target.HitLdtrAttrib);
+                    state->HitTrAttrib = static_cast<UINT32>(g_Target.HitTrAttrib);
+                    state->HitLdtrSelector = static_cast<UINT16>(g_Target.HitLdtrSelector);
+                    state->HitTrSelector = static_cast<UINT16>(g_Target.HitTrSelector);
+                    state->Reserved2 = 0;
+                    information = sizeof(HVSNAP_STATE);
+                }
             }
             status = STATUS_SUCCESS;
         }

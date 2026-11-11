@@ -131,7 +131,15 @@ typedef struct _HVSNAP_ARM_REQUEST
 // may pass a buffer of that size; the driver fills the core fields then and
 // the measured segment bases only when the full struct fits.
 //
+// HVSNAP_STATE_V2_SIZE is the size through HitCr8 (the "v2" generation: every
+// extended same-hit field before the descriptor-table tier). The driver gates
+// the tiers independently so every controller/driver generation pairing keeps
+// working: a v2 controller still receives the v2 extended fields against a v3
+// driver, and a v3 controller sees the descriptor-table fields zero (and can
+// detect that via the returned byte count) against a v2 driver.
+//
 #define HVSNAP_STATE_V1_SIZE   48u
+#define HVSNAP_STATE_V2_SIZE   232u
 typedef struct _HVSNAP_STATE
 {
     unsigned __int32 Active;        // non-zero while an ARM session is in effect
@@ -171,4 +179,28 @@ typedef struct _HVSNAP_STATE
                                     // the exit context (guest value resident)
     unsigned __int64 HitCr8;        // MEASURED guest CR8 (TPR) latched at exit
                                     // entry BEFORE the host IRQL raise
+
+    //
+    // v3 tier - MEASURED descriptor-table registers of the same park event,
+    // from the VMCB state-save area (SVM carries the full descriptor cache,
+    // including the hidden LDTR/TR base/limit/attributes). These are the
+    // values SGDT/SIDT/SLDT/STR would have returned had the target executed
+    // them at the frozen instruction. Selectors are 16-bit; limits 20-bit
+    // values stored 32-bit wide; attributes carry the VMCB segment-attrib
+    // encoding (bits: type(0-3), S(4), DPL(5-6), P(7), AVL(8), L(13),
+    // D/B(14), G(15)) for the descriptor-cache view.
+    //
+    unsigned __int64 HitGdtrBase;     // MEASURED GDTR base
+    unsigned __int64 HitIdtrBase;     // MEASURED IDTR base
+    unsigned __int64 HitLdtrBase;     // MEASURED LDTR base (hidden descriptor cache)
+    unsigned __int64 HitTrBase;       // MEASURED TR base (hidden descriptor cache)
+    unsigned __int32 HitGdtrLimit;    // MEASURED GDTR limit
+    unsigned __int32 HitIdtrLimit;    // MEASURED IDTR limit
+    unsigned __int32 HitLdtrLimit;    // MEASURED LDTR limit (hidden)
+    unsigned __int32 HitTrLimit;      // MEASURED TR limit (hidden)
+    unsigned __int32 HitLdtrAttrib;   // MEASURED LDTR attributes (hidden)
+    unsigned __int32 HitTrAttrib;     // MEASURED TR attributes (hidden)
+    unsigned __int16 HitLdtrSelector; // MEASURED LDTR selector (what SLDT returns)
+    unsigned __int16 HitTrSelector;   // MEASURED TR selector (what STR returns)
+    unsigned __int32 Reserved2;       // zero; keeps 8-byte struct alignment
 } HVSNAP_STATE, *PHVSNAP_STATE;

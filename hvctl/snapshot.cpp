@@ -20,6 +20,7 @@
 #include <cstring>
 #include <vector>
 #include <sstream>
+#include <algorithm>
 #include <tlhelp32.h>
 
 // Provenance stamped into each snapshot's hvtrace.json. Bump on format changes.
@@ -624,6 +625,373 @@ void WriteExtendedSidecar(HANDLE hProc, DWORD pid, DWORD hitTid,
     WriteTextFile(dir + "\\snapshot.ext.json", j.str());
 }
 
+// ============================================================================
+// v3 sidecar (snapshot.ext3.json, schema slf.hvtrace.snapshot-ext.v3)
+//
+// A SEPARATE artifact: the v2 sidecar above is frozen (byte-stable for the
+// engine's intake) and is not modified by the v3 work. The v3 sidecar adds:
+//   - cpu_identity:    leaf-0 vendor string + max leaves (measured, the seed
+//                      the engine's vendor-law fragments key on) + the
+//                      family/model/stepping decode of v2's leaf1_eax;
+//   - tsc_calibration: leaves 0x15/0x16 (zeros => not enumerated, stated);
+//   - descriptor_tables: GDTR/IDTR/LDTR/TR measured at the park event by the
+//                      v3 driver tier (SGDT/SIDT/SLDT/STR ground truth);
+//   - fp_state_upper:  XSAVE extended features past x87/SSE (YMM upper
+//                      halves, k-masks, ZMM sections) via CONTEXT_XSTATE;
+//   - integrity:       sha256 of every emitted file (self excluded).
+// Absent is always reported, never zero-filled.
+// ============================================================================
+
+//
+// Minimal FIPS 180-4 SHA-256 over a file, streaming in 64 KiB chunks.
+// Returns the lowercase hex digest; empty string on any I/O failure.
+//
+static std::string Sha256File(const std::string& path)
+{
+    static const unsigned int K[64] = {
+        0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+        0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+        0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+        0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+        0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+        0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+        0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+        0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2 };
+    unsigned int h[8] = { 0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
+                          0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19 };
+    unsigned long long totalBits = 0;
+    unsigned pending = 0;                     // carried partial-block bytes at buf front
+    unsigned char buf[64 * 1024];
+
+    HANDLE f = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) { return std::string(); }
+
+    // K is a function-local static: reachable inside the lambda without
+    // capture (only automatic locals need capturing; statics have fixed
+    // addresses and capturing them is ill-formed).
+    auto compress = [&h](const unsigned char* p) {
+        unsigned int w[64];
+        for (int i = 0; i < 16; ++i) {
+            w[i] = ((unsigned)p[i*4] << 24) | ((unsigned)p[i*4+1] << 16) |
+                   ((unsigned)p[i*4+2] << 8) | (unsigned)p[i*4+3];
+        }
+        for (int i = 16; i < 64; ++i) {
+            unsigned int s0 = ((w[i-15] >> 7) | (w[i-15] << 25)) ^ ((w[i-15] >> 18) | (w[i-15] << 14)) ^ (w[i-15] >> 3);
+            unsigned int s1 = ((w[i-2] >> 17) | (w[i-2] << 15)) ^ ((w[i-2] >> 19) | (w[i-2] << 13)) ^ (w[i-2] >> 10);
+            w[i] = w[i-16] + s0 + w[i-7] + s1;
+        }
+        unsigned int a=h[0],b=h[1],c=h[2],d=h[3],e=h[4],f2=h[5],g=h[6],hh=h[7];
+        for (int i = 0; i < 64; ++i) {
+            unsigned int S1 = ((e >> 6) | (e << 26)) ^ ((e >> 11) | (e << 21)) ^ ((e >> 25) | (e << 7));
+            unsigned int ch = (e & f2) ^ (~e & g);
+            unsigned int t1 = hh + S1 + ch + K[i] + w[i];
+            unsigned int S0 = ((a >> 2) | (a << 30)) ^ ((a >> 13) | (a << 19)) ^ ((a >> 22) | (a << 10));
+            unsigned int maj = (a & b) ^ (a & c) ^ (b & c);
+            unsigned int t2 = S0 + maj;
+            hh=g; g=f2; f2=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
+        }
+        h[0]+=a; h[1]+=b; h[2]+=c; h[3]+=d; h[4]+=e; h[5]+=f2; h[6]+=g; h[7]+=hh;
+    };
+
+    for (;;) {
+        DWORD got = 0;
+        if (!ReadFile(f, buf + pending, sizeof(buf) - pending, &got, nullptr)) {
+            CloseHandle(f);
+            return std::string();
+        }
+        if (got == 0) { break; }              // EOF
+        unsigned avail = pending + got;
+        totalBits += (unsigned long long)got * 8ull;
+        unsigned whole = avail - (avail % 64);
+        for (unsigned off = 0; off < whole; off += 64) { compress(buf + off); }
+        pending = avail - whole;
+        if (pending != 0) { memmove(buf, buf + whole, pending); }
+    }
+    CloseHandle(f);
+
+    // Finalize: pending bytes + 0x80 + zero pad + 64-bit big-endian bit length.
+    unsigned char tail[128];
+    unsigned len = (pending + 9 <= 64) ? 64 : 128;
+    memset(tail, 0, sizeof(tail));
+    memcpy(tail, buf, pending);
+    tail[pending] = 0x80;
+    unsigned long long bits = totalBits;
+    for (int i = 0; i < 8; ++i) { tail[len - 1 - i] = (unsigned char)(bits & 0xff); bits >>= 8; }
+    for (unsigned off = 0; off < len; off += 64) { compress(tail + off); }
+
+    char out[65];
+    for (int i = 0; i < 8; ++i) { _snprintf_s(out + i * 8, 9, _TRUNCATE, "%08x", h[i]); }
+    return std::string(out);
+}
+
+//
+// One extended XSAVE feature read from the parked hit thread via
+// CONTEXT_XSTATE + LocateXStateFeature (the documented accessor; no layout
+// assumptions). Returns false when the feature is not enabled (xcr0) or the
+// read fails - the sidecar then reports it absent.
+//
+static bool ReadXsaveFeature(DWORD hitTid, DWORD feature, std::vector<unsigned char>& out)
+{
+    unsigned long long xcr0 = _xgetbv(0);
+    if (!(xcr0 & (1ull << feature))) { return false; }
+
+    HANDLE th = OpenThread(THREAD_GET_CONTEXT, FALSE, hitTid);
+    if (th == nullptr) { return false; }
+    bool ok = false;
+    PCONTEXT ctx = nullptr;
+    DWORD ctxSize = 0;
+    InitializeContext(nullptr, CONTEXT_XSTATE, &ctx, &ctxSize);
+    // ^ size probe: fails with ERROR_INSUFFICIENT_BUFFER and fills ctxSize
+    std::vector<unsigned char> buf(ctxSize == 0 ? sizeof(CONTEXT) * 2 : ctxSize);
+    if (InitializeContext(buf.data(), CONTEXT_XSTATE, &ctx, &ctxSize) && ctx != nullptr)
+    {
+        if (SetXStateFeaturesMask(ctx, (1ull << feature) | 3ull /* legacy x87+SSE */) &&
+            GetThreadContext(th, ctx))
+        {
+            ULONG len = 0;
+            void* p = LocateXStateFeature(ctx, feature, &len);
+            if (p != nullptr && len > 0)
+            {
+                const unsigned char* raw = static_cast<const unsigned char*>(p);
+                out.assign(raw, raw + len);
+                ok = true;
+            }
+        }
+    }
+    CloseHandle(th);
+    return ok;
+}
+
+static std::string BytesToHex(const unsigned char* p, size_t n)
+{
+    std::string s;
+    s.reserve(n * 2);
+    char hx[3];
+    for (size_t i = 0; i < n; ++i)
+    {
+        _snprintf_s(hx, sizeof(hx), _TRUNCATE, "%02x", (unsigned)p[i]);
+        s += hx;
+    }
+    return s;
+}
+
+//
+// The v3 sidecar writer. Called LAST, after every other snapshot file exists
+// (integrity hashes them all; this file itself is excluded).
+//
+static void WriteExt3Sidecar(const std::string& dir,
+                             unsigned long long targetRip,
+                             DWORD hitTid,
+                             const Ext3DescriptorTables& dt)
+{
+    std::ostringstream j;
+    j << "{\n";
+    j << "  \"schema\": \"slf.hvtrace.snapshot-ext.v3\",\n";
+    j << "  \"created_utc\": \"" << IsoTimestampUtc() << "\",\n";
+    j << "  \"freeze_rip\": \"" << Hex(targetRip) << "\",\n";
+    j << "  \"hit_tid\": " << (unsigned)hitTid << ",\n";
+
+    // --- cpu identity: leaf 0 (vendor string, max leaves) + leaf1 decode ---
+    int id[4] = {};
+    __cpuid(id, 0);
+    unsigned maxLeaf = (unsigned)id[0];
+    char vendor[13] = {};
+    memcpy(vendor + 0, &id[1], 4);      // EBX
+    memcpy(vendor + 4, &id[3], 4);      // EDX
+    memcpy(vendor + 8, &id[2], 4);      // ECX
+    int ext[4] = {};
+    __cpuid(ext, 0x80000000);
+    unsigned maxExtLeaf = (unsigned)ext[0];
+    int l1[4] = {};
+    __cpuid(l1, 1);
+    unsigned eax1 = (unsigned)l1[0];
+    unsigned stepping = eax1 & 0xF;
+    unsigned model = (eax1 >> 4) & 0xF;
+    unsigned family = (eax1 >> 8) & 0xF;
+    unsigned extModel = (eax1 >> 12) & 0xF;
+    unsigned extFamily = (eax1 >> 20) & 0xFF;
+    if (family == 0xF) { family += extFamily; model |= (extModel << 4); }
+
+    j << "  \"cpu_identity\": {\n";
+    j << "    \"vendor\": \"" << vendor << "\",\n";
+    j << "    \"vendor_hex\": \"" << BytesToHex((const unsigned char*)vendor, 12) << "\",\n";
+    j << "    \"max_leaf\": " << maxLeaf << ", \"max_extended_leaf\": " << maxExtLeaf << ",\n";
+    j << "    \"family\": " << family << ", \"model\": " << model << ", \"stepping\": " << stepping << ",\n";
+    j << "    \"leaf1_eax\": \"" << Hex((unsigned long long)eax1) << "\",\n";
+    j << "    \"provenance\": \"host_cpu_enumeration\",\n";
+    j << "    \"note\": \"vendor/family/model/stepping decoded per the SDM; family/model shown in display form; leaf1_eax also appears in the v2 sidecar (cpuid.leaf1_eax)\"\n";
+    j << "  },\n";
+
+    // --- TSC calibration leaves (zeros mean not enumerated - stated, not guessed) ---
+    int l15[4] = {}; __cpuid(l15, 0x15);
+    int l16[4] = {}; __cpuid(l16, 0x16);
+    bool have15 = l15[0] != 0 && l15[1] != 0;
+    bool have16 = l16[0] != 0;
+    j << "  \"tsc_calibration\": {\n";
+    if (have15)
+    {
+        j << "    \"leaf15_core_clock_numerator\": " << (unsigned)l15[0] << ",\n";
+        j << "    \"leaf15_ref_clock_denominator\": " << (unsigned)l15[1] << ",\n";
+        if (l15[2] != 0) { j << "    \"leaf15_nominal_tsc_hz\": " << (unsigned)l15[2] << ",\n"; }
+        else { j << "    \"leaf15_nominal_tsc_hz\": null,\n"; }
+    }
+    if (have16)
+    {
+        j << "    \"leaf16_base_mhz\": " << (unsigned)l16[0] << ",\n";
+        if (l16[1] != 0) { j << "    \"leaf16_max_mhz\": " << (unsigned)l16[1] << ",\n"; }
+        if (l16[2] != 0) { j << "    \"leaf16_bus_mhz\": " << (unsigned)l16[2] << ",\n"; }
+    }
+    if (!have15 && !have16)
+    {
+        j << "    \"status\": \"absent\",\n";
+        j << "    \"note\": \"CPUID 0x15/0x16 not enumerated by this CPU\",\n";
+    }
+    j << "    \"provenance\": \"host_cpu_enumeration\"\n";
+    j << "  },\n";
+
+    // --- descriptor tables (v3 driver tier, same-hit) ---
+    j << "  \"descriptor_tables\": {\n";
+    if (dt.present)
+    {
+        j << "    \"gdtr\": { \"base\": \"" << Hex(dt.gdtr_base) << "\", \"limit\": " << dt.gdtr_limit << " },\n";
+        j << "    \"idtr\": { \"base\": \"" << Hex(dt.idtr_base) << "\", \"limit\": " << dt.idtr_limit << " },\n";
+        j << "    \"ldtr\": { \"selector\": \"" << Hex((unsigned long long)dt.ldtr_selector) << "\", \"base\": \""
+          << Hex(dt.ldtr_base) << "\", \"limit\": " << dt.ldtr_limit
+          << ", \"attrib\": \"" << Hex((unsigned long long)dt.ldtr_attrib) << "\" },\n";
+        j << "    \"tr\": { \"selector\": \"" << Hex((unsigned long long)dt.tr_selector) << "\", \"base\": \""
+          << Hex(dt.tr_base) << "\", \"limit\": " << dt.tr_limit
+          << ", \"attrib\": \"" << Hex((unsigned long long)dt.tr_attrib) << "\" },\n";
+        j << "    \"provenance\": \"same_hit_guest\",\n";
+        j << "    \"note\": \"VMCB descriptor-cache view at the park event; base/limit are what SGDT/SIDT store, selectors what SLDT/STR store, attrib is the hidden descriptor-cache attribute word\"\n";
+    }
+    else
+    {
+        j << "    \"status\": \"absent\",\n";
+        j << "    \"note\": \"driver without descriptor-table capture (pre-v3 tier); QUERY returned fewer bytes\"\n";
+    }
+    j << "  },\n";
+
+    // --- XSAVE upper state: YMM upper halves (AVX), k-masks / ZMM (AVX-512) ---
+    j << "  \"fp_state_upper\": {\n";
+    {
+        struct Up { const char* name; std::string value; };
+        std::vector<Up> ups;
+        std::vector<unsigned char> feat;
+        std::string note = "x87/SSE (fctrl..st7, mxcsr, xmm0-15) is in the v2 sidecar fp_state; these are the XSAVE features beyond it";
+        bool any = false;
+
+        if (ReadXsaveFeature(hitTid, 2 /* XSTATE_AVX */, feat))   // 16 x 16B YMM uppers
+        {
+            any = true;
+            for (int i = 0; i < 16 && (size_t)(i * 16 + 16) <= feat.size(); ++i)
+            {
+                char name[16];
+                _snprintf_s(name, sizeof(name), _TRUNCATE, "ymm%d_upper", i);
+                ups.push_back({name, BytesToHex(&feat[(size_t)i * 16], 16)});
+            }
+        }
+        if (ReadXsaveFeature(hitTid, 5 /* AVX-512 opmask */, feat))   // 8 x 8B k0..k7
+        {
+            any = true;
+            for (int i = 0; i < 8 && (size_t)(i * 8 + 8) <= feat.size(); ++i)
+            {
+                char name[8];
+                _snprintf_s(name, sizeof(name), _TRUNCATE, "k%d", i);
+                ups.push_back({name, BytesToHex(&feat[(size_t)i * 8], 8)});
+            }
+        }
+        if (ReadXsaveFeature(hitTid, 6 /* AVX-512 ZMM0-15 upper */, feat))   // 16 x 32B
+        {
+            any = true;
+            for (int i = 0; i < 16 && (size_t)(i * 32 + 32) <= feat.size(); ++i)
+            {
+                char name[16];
+                _snprintf_s(name, sizeof(name), _TRUNCATE, "zmm%d_upper", i);
+                ups.push_back({name, BytesToHex(&feat[(size_t)i * 32], 32)});
+            }
+        }
+        if (ReadXsaveFeature(hitTid, 7 /* AVX-512 ZMM16-31 */, feat))   // 16 x 64B
+        {
+            any = true;
+            for (int i = 16; i < 32 && (size_t)((i - 16) * 64 + 64) <= feat.size(); ++i)
+            {
+                char name[16];
+                _snprintf_s(name, sizeof(name), _TRUNCATE, "zmm%d", i);
+                ups.push_back({name, BytesToHex(&feat[(size_t)(i - 16) * 64], 64)});
+            }
+        }
+
+        if (any)
+        {
+            for (size_t i = 0; i < ups.size(); ++i)
+            {
+                j << "    \"" << ups[i].name << "\": { \"value\": \"" << ups[i].value
+                  << "\", \"provenance\": \"parked_thread_context\" }" << (i + 1 < ups.size() ? "," : "") << "\n";
+            }
+            j << "    \"encoding\": \"xsave_feature_bytes\",\n";
+            j << "    \"provenance\": \"parked_thread_context\",\n";
+            j << "    \"note\": \"" << note << "\"\n";
+        }
+        else
+        {
+            j << "    \"status\": \"absent\",\n";
+            unsigned long long xcr0 = _xgetbv(0);
+            if (!(xcr0 & 0x4ull)) { j << "    \"note\": \"AVX not enabled in XCR0 on this host (see v2 sidecar xstate); no extended features to read\"\n"; }
+            else { j << "    \"note\": \"CONTEXT_XSTATE read failed for the parked thread\"\n"; }
+        }
+    }
+    j << "  },\n";
+
+    // --- integrity: sha256 of every emitted file (self excluded) ---
+    j << "  \"integrity\": {\n";
+    {
+        std::vector<std::string> names;
+        WIN32_FIND_DATAA fd;
+        HANDLE find = FindFirstFileA((dir + "\\*").c_str(), &fd);
+        if (find != INVALID_HANDLE_VALUE)
+        {
+            do {
+                if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) { continue; }
+                if (strcmp(fd.cFileName, "snapshot.ext3.json") == 0) { continue; }
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) { continue; }
+                names.push_back(fd.cFileName);
+            } while (FindNextFileA(find, &fd));
+            FindClose(find);
+        }
+        std::sort(names.begin(), names.end());
+
+        unsigned long long totalBytes = 0;
+        unsigned hashed = 0;
+        std::ostringstream files;
+        for (size_t i = 0; i < names.size(); ++i)
+        {
+            std::string sha = Sha256File(dir + "\\" + names[i]);
+            if (sha.empty()) { continue; }
+            unsigned long long sz = 0;
+            HANDLE f = CreateFileA((dir + "\\" + names[i]).c_str(), GENERIC_READ, FILE_SHARE_READ,
+                                   nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (f != INVALID_HANDLE_VALUE)
+            {
+                LARGE_INTEGER li{};
+                if (GetFileSizeEx(f, &li)) { sz = (unsigned long long)li.QuadPart; }
+                CloseHandle(f);
+            }
+            totalBytes += sz;
+            ++hashed;
+            files << "    { \"name\": \"" << names[i] << "\", \"bytes\": " << sz
+                  << ", \"sha256\": \"" << sha << "\" }" << (i + 1 < names.size() ? "," : "") << "\n";
+        }
+        j << "    \"algorithm\": \"sha256\",\n";
+        j << "    \"files\": [\n" << files.str() << "    ],\n";
+        j << "    \"total_files\": " << hashed << ", \"total_bytes\": " << totalBytes << ",\n";
+        j << "    \"note\": \"hashes every regular file in this snapshot directory except snapshot.ext3.json itself (this file is written last)\"\n";
+    }
+    j << "  }\n";
+    j << "}\n";
+    WriteTextFile(dir + "\\snapshot.ext3.json", j.str());
+}
+
 } // namespace
 
 bool WriteSnapshot(HANDLE hProc,
@@ -657,7 +1025,9 @@ bool WriteSnapshot(HANDLE hProc,
                    unsigned long long measuredTscGuest,
                    unsigned long long measuredTscAux,
                    unsigned long long measuredCr8,
-                   bool haveMeasuredExtended)
+                   bool haveMeasuredExtended,
+                   const Ext3DescriptorTables& descriptorTables,
+                   bool writeExt3)
 {
     // tag = <prefix>_000_rip<rip>  (single snapshot per run => seq 0)
     char tagbuf[128];
@@ -912,5 +1282,13 @@ bool WriteSnapshot(HANDLE hProc,
                          measuredCpl, measuredGPat, measuredDbgCtl,
                          measuredTscGuest, measuredTscAux, measuredCr8,
                          haveMeasuredExtended);
+
+    // --- 7. snapshot.ext3.json: v3 extended-state sidecar. A SEPARATE file -
+    //     the v2 sidecar above stays byte-stable. Written LAST so its
+    //     integrity section hashes every other file in the directory. ---
+    if (writeExt3)
+    {
+        WriteExt3Sidecar(dir, targetRip, hitTid, descriptorTables);
+    }
     return true;
 }

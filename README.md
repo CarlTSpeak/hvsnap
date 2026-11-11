@@ -27,6 +27,13 @@ read exactly those.)*
   EFER, DR6/7, SYSCALL/SYSENTER MSRs, CPL, PAT, DBGCTL, guest-visible TSC,
   TSC_AUX, CR8), full parked x87/SSE state, and CPUID/xcr0 host facts — every
   field provenance-labeled; absent is reported, never zero-filled.
+- **v3 sidecar** (branch `z/ext3-v3-20261111`, `snapshot.ext3.json`, schema
+  `slf.hvtrace.snapshot-ext.v3`) — measured CPU identity (leaf-0 vendor
+  string), TSC calibration leaves, descriptor tables (GDTR/IDTR/LDTR/TR at the
+  park event — SGDT/SIDT/SLDT/STR ground truth), XSAVE upper state (YMM
+  halves, k-masks, ZMM), and a sha256 integrity list of every emitted file.
+  v2 emission is untouched; `--no-ext3` skips it. Build-validated,
+  hardware validation pending.
 - **Debugger hand-off** (`debug` / `--handoff`) — leaves the thread suspended
   exactly at the RIP with the trap removed, for x64dbg/WinDbg attach.
 - **Register trace** (`trace`) — per-hit GPR/RIP/RFLAGS/CR3/segment records on
@@ -48,7 +55,12 @@ snapshot + sidecar (sidecar `fp_state` verified byte-identical to `regs.txt`),
 trace, debug hand-off, TSC cloak. See `DOCUMENTATION.md` §9.
 **The renamed tree builds clean** (hvctl, probe, driver — Release x64, see
 Build below); it has **not** been loaded or run on hardware — the §9
-validation was performed with the pre-rename `hvtrace` build.
+validation was performed with the pre-rename `hvtrace` build. The
+`z/ext3-v3-20261111` branch (v3 sidecar + descriptor-table driver tier) builds
+clean on top (hvctl: same 3 known C4100s, driver: zero warnings; SHA-256
+implementation validated 11/11 against hashlib vectors) and is likewise
+hardware-unvalidated — the descriptor-table/XSTATE paths need a quiet window
+with the v3 driver loaded, coordinated with the team.
 
 **Intel hosts:** not supported today — the driver is SVM/AMD-V only. An Intel
 VT-x + EPT variant is a recorded future item.

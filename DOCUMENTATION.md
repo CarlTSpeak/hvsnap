@@ -181,6 +181,7 @@ hvctl <freeze|snapshot|debug> --name <proc.exe> --module <mod.dll> --offset <0xN
 | `--cloak` | hide the freeze gap from the target's RDTSC/RDTSCP (anti-timing) |
 | `--keep-frozen` | (snapshot) stay frozen after the dump (thaw on Enter) instead of auto-resuming |
 | `--terminate-after` | (snapshot) after the dump and a clean thaw, terminate the target process (`TerminateProcess`, waits up to 10 s and reports if the target did not exit) — for one-shot captures of dying / DRM-fragile processes |
+| `--no-ext3` | (snapshot) skip the v3 sidecar (`snapshot.ext3.json`); the v2 sidecar (`snapshot.ext.json`) is always written |
 | `--handoff` | (snapshot) after the dump, hand off to a debugger **at the RIP** (trap removed, RIP restored) |
 | `--ring-mb N` / `--duration N` / `--max-records N` | (trace) capture-ring size, trace duration (s), record cap |
 
@@ -316,6 +317,7 @@ output **byte-for-byte**, so it drops into the existing toolchain. In
 |---|---|
 | `hvtrace.json` | provenance the Pin dumps don't carry: `hvtrace_version`, `created_utc` (ISO-8601), `target` {`pid`, `image` full path, `hit_tid`}, `freeze` {`rip`, `module`, `module_base`, `module_size`, `module_offset` — resolved from the target's own module list, not the CLI hint}, `snapshot` {`prefix`, `tag`, `format`} |
 | `snapshot.ext.json` | versioned extended-state sidecar (schema `slf.hvtrace.snapshot-ext.v2`) — see §7.5 |
+| `snapshot.ext3.json` | v3 extended sidecar (schema `slf.hvtrace.snapshot-ext.v3`): cpu identity (leaf 0), TSC calibration, descriptor tables, XSAVE upper state, per-file sha256 — see §7.6 |
 | `<tag>_regs.txt` | `# pinscan snapshot register state` + `key=0xhex` lines: `snap_rip`, `tid`, GPRs, `rip`, `rflags`, `seg_cs..seg_gs`, `fs_base`, `gs_base`, `mxcsr`, `xmm0..15` (32 hex chars each), `dr0..dr3` (parked-thread CONTEXT), `fctrl..st7` |
 | `<tag>_teb_<addr>_2000.bin` / `<tag>_peb_<addr>_1000.bin` | TEB (0x2000) / PEB (0x1000) |
 | `<tag>_stack_<addr>_<size>.bin` | full stack (TEB `StackLimit`→`StackBase`) |
@@ -359,6 +361,32 @@ compatibility; a format rename would be a separate, versioned change. The
 engine reads exactly `hvtrace.json` and the `slf.hvtrace.snapshot-ext.*`
 schema ID, and every existing capture depends on them — the *tool* was renamed
 to hvsnap, the *format* was not.
+
+### 7.6 Extended-state sidecar v3 (`snapshot.ext3.json`)
+
+*(branch `z/ext3-v3-20261111`; build-validated, hardware validation pending —
+the v2 sidecar above is frozen and byte-stable; everything below goes to a
+separate file with schema `slf.hvtrace.snapshot-ext.v3`. Skip with
+`--no-ext3`.)*
+
+| Section | Fields | Provenance |
+|---|---|---|
+| `cpu_identity` | `vendor` (leaf-0 12-byte string) + `vendor_hex`, `max_leaf`, `max_extended_leaf`, `family`/`model`/`stepping` (SDM display-form decode of v2's `leaf1_eax`) | `host_cpu_enumeration` |
+| `tsc_calibration` | leaf `0x15` (core numerator, ref denominator, nominal TSC Hz) and `0x16` (base/max/bus MHz); zeros reported as not-enumerated, never guessed | `host_cpu_enumeration` |
+| `descriptor_tables` | `gdtr`/`idtr` {base, limit}, `ldtr`/`tr` {selector, base, limit, attrib} — the VMCB descriptor-cache view at the park event; base/limit are what SGDT/SIDT store, selectors what SLDT/STR store | `same_hit_guest` (needs the v3 driver tier; a pre-v3 driver ⇒ `absent`) |
+| `fp_state_upper` | `ymm0_upper..ymm15_upper` (AVX), `k0..k7`, `zmm*_upper`, `zmm16..31` (AVX-512, when XCR0 enables them) — the XSAVE features beyond v2's `fp_state`, read via `CONTEXT_XSTATE` + `LocateXStateFeature` | `parked_thread_context` |
+| `integrity` | `sha256` + size of every regular file in the snapshot directory except `snapshot.ext3.json` itself (written last) | computed |
+
+**Why leaf 0 matters:** the engine's vendor-law selection
+(`cpu_identity.vendor` for BSF/BSR retention, FCOMI, descriptor-table and
+other vendor-divergent fragments) was previously only a declared profile
+premise; this makes it a measured fact per capture.
+
+**Driver compatibility:** QUERY fills state progressively — the v2 tier
+(segment bases … CR8) is gated by `HVSNAP_STATE_V2_SIZE` (232), the
+descriptor-table tier by the full v3 struct, so every old-controller /
+new-driver and new-controller / old-driver pairing degrades gracefully and
+`descriptor_tables` reports `absent` rather than zeros against a pre-v3 driver.
 
 ---
 

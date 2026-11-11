@@ -20,6 +20,22 @@
 #include <string>
 
 //
+// Descriptor-table registers MEASURED by the driver at the park event (v3
+// QUERY tier; SVM's VMCB carries the full descriptor cache, hidden LDTR/TR
+// fields included). `present` is false when the running driver predates the
+// tier (QUERY returned fewer bytes) - the v3 sidecar then reports the section
+// absent instead of guessing.
+//
+struct Ext3DescriptorTables
+{
+    bool present;
+    unsigned long long gdtr_base, idtr_base, ldtr_base, tr_base;
+    unsigned long gdtr_limit, idtr_limit, ldtr_limit, tr_limit;
+    unsigned long ldtr_attrib, tr_attrib;
+    unsigned short ldtr_selector, tr_selector;
+};
+
+//
 // Write a full Pinscan-format snapshot of a frozen process.
 //
 //  hProc      - handle to the target (needs VM_READ | VM_OPERATION | QUERY_INFORMATION)
@@ -69,4 +85,6 @@ bool WriteSnapshot(HANDLE hProc,
                    unsigned long long measuredTscGuest = 0,
                    unsigned long long measuredTscAux = 0,
                    unsigned long long measuredCr8 = 0,
-                   bool haveMeasuredExtended = false);
+                   bool haveMeasuredExtended = false,
+                   const Ext3DescriptorTables& descriptorTables = Ext3DescriptorTables(),
+                   bool writeExt3 = true);
