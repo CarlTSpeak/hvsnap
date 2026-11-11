@@ -97,7 +97,9 @@ hvsnap and from the pre-rename hvtrace builds are interchangeable.
 Requires WDK for VS2026, admin for sign/load, VBS/Hyper-V off, test-signing on.
 Quick start: `DOCUMENTATION.md` §3–§7 (full manual: architecture, build, host
 prep, every `hvctl` option, output formats, design notes). Host prep and
-sign/load/unload scripts: `tools/README.md`.
+sign/load/unload scripts: `tools/README.md`. Consuming captures:
+**`OUTPUT-FORMAT.md`** — the complete parser-oriented reference for every
+emitted file (row/field lists, filename grammars, provenance rules, examples).
 
 ## Provenance & license
 

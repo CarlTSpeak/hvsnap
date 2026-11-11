@@ -310,8 +310,10 @@ region appears.
 ## 7. Snapshot output (Op1)
 
 `snapshot` reproduces the Pin tool's `ExecuteSnapshot`/`DumpFullAddressSpace`
-output **byte-for-byte**, so it drops into the existing toolchain. In
-`<out>\snapshot_full_<prefix>_000_rip<rip>\`:
+output **byte-for-byte**, so it drops into the existing toolchain.
+**`OUTPUT-FORMAT.md`** (repo root) is the complete parser-oriented reference
+for every emitted file — exact row/field lists, filename grammars, real
+examples. In `<out>\snapshot_full_<prefix>_000_rip<rip>\`:
 
 | File | Contents |
 |---|---|
