@@ -73,7 +73,7 @@ hvctl\build-probe.cmd     # probe.exe  (cl /EHsc, x64)
   `Inf2Cat`/`DrvCat` skipped (no inf/catalog by design). Driver **not loaded**
   (loading requires elevation + test-signing; see `tools/README.md`).
 
-## Feeding the snapshots into slf-symbolic
+## Feeding the snapshots into Semantic Lifting Framwork
 
 Snapshots are consumed by the product as `--input-kind=hvtrace-snapshot` and
 read from `hvtrace.json` / `snapshot.ext.json` (`slf.hvtrace.snapshot-ext.*`).
@@ -89,7 +89,7 @@ sign/load/unload scripts: `tools/README.md`.
 
 ## Provenance & license
 
-MIT — see `LICENSE` (Copyright (c) 2026 CarlTSpeak).
+MIT — see `LICENSE` (Copyright (c) 2026 SLF Labs).
 
 Fork of [tandasat/SimpleSvm](https://github.com/tandasat/SimpleSvm) (MIT), with
 the NPT execute-trap machinery adapted from
