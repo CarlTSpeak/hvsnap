@@ -89,10 +89,10 @@ sign/load/unload scripts: `tools/README.md`.
 
 ## Provenance & license
 
+MIT — see `LICENSE` (Copyright (c) 2026 CarlTSpeak).
+
 Fork of [tandasat/SimpleSvm](https://github.com/tandasat/SimpleSvm) (MIT), with
 the NPT execute-trap machinery adapted from
 [tandasat/SimpleSvmHook](https://github.com/tandasat/SimpleSvmHook) (MIT) —
-verbatim MIT notices in `THIRD_PARTY/`, derivation record in `LINEAGE.md`.
-hvsnap's own additions (measured same-hit state capture, the extended-state
-sidecar, trace mode, TSC cloak, conditional triggers, launch/terminate flows):
-Copyright (c) the SLF owner; licence: see repository.
+verbatim MIT notices in `THIRD_PARTY/`, derivation record in `LINEAGE.md`;
+they apply to the derived portions (see `LINEAGE.md` for the file map).
