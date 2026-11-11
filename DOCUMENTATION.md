@@ -33,7 +33,7 @@ obvious approaches:
 
 - The trap lives in the **nested page tables**, which the guest has **no
   instruction, register, or memory access to** — it cannot see, read, or clear
-  it. *Undetectable and unremovable from inside the VM.*
+  it. *Much harder to detect and detach from inside the VM.*
 - Only **execute** is trapped; **reads/writes pass through untouched**, so the
   target's own code-integrity checks read pristine bytes and pass.
 - No target bytes are ever modified.
@@ -203,7 +203,7 @@ The hit line reports `matches=` so you can see how many times the condition held
 
 Structurally the freeze is invisible (NPT), but on thaw the target's wall-clock
 has jumped by the snapshot/hold duration — a cross-freeze `RDTSC`/`RDTSCP` delta
-check (Denuvo-style) would see the gap. `--cloak` intercepts the target's
+check would see the gap. `--cloak` intercepts the target's
 `RDTSC`/`RDTSCP` (CR3-gated) and subtracts the accumulated frozen cycles, so the
 gap vanishes; other processes read the true TSC. Measured: a 3 s freeze's
 cross-freeze delta dropped from ~10.5 G cycles to ~0.16 G (67×).
