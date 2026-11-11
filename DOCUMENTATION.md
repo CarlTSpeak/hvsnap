@@ -223,7 +223,7 @@ hvctl cloak-off    # remove the intercept when finished
   check / manual inspection.
 - **`snapshot`** — freeze, write a full Pinscan-format snapshot, then thaw.
   ```powershell
-  hvctl snapshot --name game.exe --module game.exe --offset 0x14130 --out C:\dumps
+  hvctl snapshot --name target.exe --module target.exe --offset 0x14130 --out C:\dumps
   ```
   The dump is taken **while every thread is suspended**, so it is a coherent
   point-in-time image. By default the target auto-resumes the instant the dump
