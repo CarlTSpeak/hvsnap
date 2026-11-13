@@ -809,7 +809,7 @@ static void WriteExt3Sidecar(const std::string& dir,
     unsigned stepping = eax1 & 0xF;
     unsigned model = (eax1 >> 4) & 0xF;
     unsigned family = (eax1 >> 8) & 0xF;
-    unsigned extModel = (eax1 >> 12) & 0xF;
+    unsigned extModel = (eax1 >> 16) & 0xF;   // EAX[19:16], NOT [15:12]
     unsigned extFamily = (eax1 >> 20) & 0xFF;
     if (family == 0xF) { family += extFamily; model |= (extModel << 4); }
 
@@ -875,7 +875,9 @@ static void WriteExt3Sidecar(const std::string& dir,
     // --- XSAVE upper state: YMM upper halves (AVX), k-masks / ZMM (AVX-512) ---
     j << "  \"fp_state_upper\": {\n";
     {
-        struct Up { const char* name; std::string value; };
+        // name must be a std::string: a const char* would alias the loop-local
+        // buffer and every row would print the last-written name.
+        struct Up { std::string name; std::string value; };
         std::vector<Up> ups;
         std::vector<unsigned char> feat;
         std::string note = "x87/SSE (fctrl..st7, mxcsr, xmm0-15) is in the v2 sidecar fp_state; these are the XSAVE features beyond it";
@@ -926,8 +928,10 @@ static void WriteExt3Sidecar(const std::string& dir,
         {
             for (size_t i = 0; i < ups.size(); ++i)
             {
+                // every row ends with a separator: the encoding/provenance/note
+                // lines follow as further keys of the same object
                 j << "    \"" << ups[i].name << "\": { \"value\": \"" << ups[i].value
-                  << "\", \"provenance\": \"parked_thread_context\" }" << (i + 1 < ups.size() ? "," : "") << "\n";
+                  << "\", \"provenance\": \"parked_thread_context\" },\n";
             }
             j << "    \"encoding\": \"xsave_feature_bytes\",\n";
             j << "    \"provenance\": \"parked_thread_context\",\n";
