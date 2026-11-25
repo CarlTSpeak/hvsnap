@@ -1203,7 +1203,17 @@ SvHandleDebugException (
     {
         //
         // Completed one instruction. Re-arm the trap and stop single-stepping.
+        // Review fix (2): the RECHECK move keeps SplitTable non-null, but a
+        // disarm or a failed move can land here first — null/arm check
+        // before touching the table.
         //
+        if (InterlockedCompareExchange(&g_Target.NptArmed, 1, 1) == 0 ||
+            g_Target.SplitTable == nullptr)
+        {
+            g_StepState[processorIndex].Stepping = FALSE;
+            VpData->GuestVmcb.ControlArea.TlbControl = SVM_TLB_CONTROL_FLUSH_ALL;
+            return;
+        }
         g_Target.SplitTable->Entries[g_Target.PtIndex].Fields.NoExecute = 1;
         if (g_StepState[processorIndex].GuestTfWasSet == FALSE)
         {
@@ -1556,6 +1566,13 @@ SvArmNptTrap (
             status = STATUS_UNSUCCESSFUL;
             __leave;
         }
+        //
+        // Review fix (4): derive gpa from the LOCKED MDL's frame, not a
+        // second lookup — a COW between the lock and this read would
+        // otherwise trap a frame that is not the pinned one.
+        //
+        pa.QuadPart = static_cast<LONGLONG>(
+            MmGetMdlPfnArray(mdl)[0]) << PAGE_SHIFT;
         status = STATUS_SUCCESS;
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
@@ -1677,16 +1694,23 @@ SvArmNptTrap (
     // Install the trap: repoint the PDE at the new 4KB page table (clear the
     // large-page bit) using the 4KB-entry view (PageFrameNumber [12:51]) to
     // write a table pointer. From here, fetches of the target page fault.
+    // Build the entry in a local and publish it with ONE 64-bit store so a
+    // concurrent walk on another core never sees a not-present or
+    // frame-0 PDE.
     //
     ptPa = MmGetPhysicalAddress(splitTable);
-    pdeAsTablePointer = reinterpret_cast<PPML4_ENTRY_2MB>(pde);
-    pdeAsTablePointer->AsUInt64 = 0;
-    pdeAsTablePointer->Fields.Valid = 1;
-    pdeAsTablePointer->Fields.Write = 1;
-    pdeAsTablePointer->Fields.User = 1;
-    pdeAsTablePointer->Fields.PageFrameNumber =
-        static_cast<UINT64>(ptPa.QuadPart) >> PAGE_SHIFT;
-    pdeAsTablePointer->Fields.NoExecute = 0;
+    {
+        PML4_ENTRY_2MB pdeValue;
+        pdeValue.AsUInt64 = 0;
+        pdeValue.Fields.Valid = 1;
+        pdeValue.Fields.Write = 1;
+        pdeValue.Fields.User = 1;
+        pdeValue.Fields.PageFrameNumber =
+            static_cast<UINT64>(ptPa.QuadPart) >> PAGE_SHIFT;
+        pdeValue.Fields.NoExecute = 0;
+        pdeAsTablePointer = reinterpret_cast<PPML4_ENTRY_2MB>(pde);
+        pdeAsTablePointer->AsUInt64 = pdeValue.AsUInt64;
+    }
 
     //
     // Flush every core's nested TLB so the split/NX takes effect everywhere.
@@ -1833,24 +1857,33 @@ SvDisarmNptTrap (
                     the target VA again; when the backing guest-physical frame
                     changed it MOVES the trap — never repoints a live leaf's
                     PFN (that would alias every old-GPA access onto the new
-                    frame): (1) restore the old 2MB PDE + nested-TLB flush,
-                    free the old split table, unlock the old MDL; (2) pin the
-                    new frame and install a fresh split table + NX leaf for
-                    the new GPA (its own 2MB region and saved PDE); (3) flush.
-                    NptArmed stays 1 across the move so an in-flight #NPF
-                    handler always sees a valid g_Target; the PDE-restore
-                    flush retires any in-flight handler before resources are
-                    freed (the disarm discipline).
+                    frame). Review-hardened order (F's kernel-safety review):
 
-                    No-op success (Changed=0) when the frame is unchanged, the
-                    trap is not armed, or the target already parked. Serialized
-                    against concurrent RECHECKs with a busy flag.
+                    1. Pin the new frame under attach (locked flag; the MDL's
+                       PFN is the trapped frame — no second lookup; probe
+                       failures abort with the OLD trap still armed and the
+                       error returned).
+                    2. Validate the >1 TB identity-map limit; allocate AND
+                       fill the new split table BEFORE any teardown, so
+                       g_Target.SplitTable is never null while NptArmed is 1,
+                       and any failure here leaves the old trap fully armed.
+                    3. Swap in ONE window: capture the old region/PDE/MDL
+                       locals, publish the new table/index/gpa/MDL into
+                       g_Target, repoint the new region's PDE with a single
+                       64-bit store, restore the old region's PDE (single
+                       store) when the move crossed regions, flush every core,
+                       and only then free the old split table and unlock the
+                       old MDL — the flush retires any in-flight #NPF/#DB
+                       handler before the old resources go away.
+
+                    NptArmed stays 1 across the move. No-op success
+                    (Changed=0) when the frame is unchanged, the trap is not
+                    armed, or the target already parked; errors propagate
+                    (hvctl surfaces them). Serialized by a busy flag.
 
     @param[out]     Reply - old/new GPAs and Changed (always filled).
 
-    @result         STATUS_SUCCESS (see Changed), or an error. On a mid-move
-                    failure the trap is fully disarmed (safe state), never
-                    half-armed.
+    @result         STATUS_SUCCESS (see Changed), or an error.
 */
 _IRQL_requires_max_(PASSIVE_LEVEL)
 static
@@ -1862,16 +1895,22 @@ SvRecheckNptTrap (
     NTSTATUS status;
     KAPC_STATE apcState;
     BOOLEAN attached;
+    BOOLEAN newLocked;
     PMDL newMdl;
-    PHYSICAL_ADDRESS newPa;
+    PMDL oldMdl;
+    PNESTED_PAGE_TABLE newSplit;
+    PNESTED_PAGE_TABLE oldSplit;
+    PD_ENTRY_2MB oldSavedPde;
+    PPD_ENTRY_2MB oldPde;
     UINT64 newGpa;
     UINT64 cr3;
-    PNESTED_PAGE_TABLE newSplit;
-    PPD_ENTRY_2MB pde;
-    PPML4_ENTRY_2MB pdeAsTablePointer;
-    PPML4E_TREE tree;
-    PHYSICAL_ADDRESS ptPa;
     ULONG pml4Index, pdptIndex, pdIndex, ptIndex;
+    PPML4E_TREE tree;
+    PPD_ENTRY_2MB newPde;
+    PPML4_ENTRY_2MB newPdeAsTablePointer;
+    PML4_ENTRY_2MB newPdeValue;
+    PHYSICAL_ADDRESS ptPa;
+    BOOLEAN sameRegion;
 
     RtlZeroMemory(Reply, sizeof(*Reply));
     Reply->OldGpa = g_Target.TargetGpa;
@@ -1894,14 +1933,18 @@ SvRecheckNptTrap (
     }
 
     attached = FALSE;
+    newLocked = FALSE;
     newMdl = nullptr;
     newSplit = nullptr;
+    newGpa = 0;
     cr3 = 0;
-    newPa.QuadPart = 0;
 
     //
-    // Resolve the CURRENT translation and pin the new frame BEFORE touching
-    // the old trap: a pin failure then aborts with the old trap still armed.
+    // (1) Resolve and PIN the new frame first. The MDL's PFN is the trapped
+    // frame (review fix 4): a COW between lock and a second lookup would
+    // otherwise trap an unpinned frame. A probe failure aborts with the old
+    // trap still armed and returns the ERROR (review fix 1: unlock only the
+    // locked, always free the MDL, never swallow the error).
     //
     KeStackAttachProcess(g_Target.TargetProcess, &apcState);
     attached = TRUE;
@@ -1916,12 +1959,9 @@ SvRecheckNptTrap (
             __leave;
         }
         MmProbeAndLockPages(newMdl, UserMode, IoReadAccess);
-        newPa = MmGetPhysicalAddress(reinterpret_cast<PVOID>(g_Target.TargetRip));
-        if (newPa.QuadPart == 0)
-        {
-            status = STATUS_UNSUCCESSFUL;
-            __leave;
-        }
+        newLocked = TRUE;
+        newGpa = static_cast<UINT64>(
+            MmGetMdlPfnArray(newMdl)[0]) << PAGE_SHIFT;
         status = STATUS_SUCCESS;
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
@@ -1933,10 +1973,9 @@ SvRecheckNptTrap (
 
     if (!NT_SUCCESS(status))
     {
-        goto Abort;                          // old trap still armed, unchanged
+        goto Abort;                          // old trap still armed; return error
     }
 
-    newGpa = static_cast<UINT64>(newPa.QuadPart) & ~(static_cast<UINT64>(PAGE_SIZE) - 1);
     if (newGpa == g_Target.TargetGpa)
     {
         Reply->NewGpa = newGpa;
@@ -1944,8 +1983,7 @@ SvRecheckNptTrap (
     }
 
     //
-    // A park may have raced in while we resolved; re-check before tearing
-    // the old leaf down (a parked target must not be disturbed).
+    // A park may have raced in while we resolved; re-check before moving.
     //
     if (InterlockedCompareExchange(&g_Target.Hit, 1, 1) != 0)
     {
@@ -1954,38 +1992,15 @@ SvRecheckNptTrap (
     }
 
     //
-    // (1) Move, step one: retire the old leaf. Restore the saved 2MB PDE and
-    // flush — the flush retires any in-flight #NPF handler before we free
-    // the split table. NptArmed stays 1 throughout (handler validity).
-    //
-    if (g_Target.Pde != nullptr)
-    {
-        *g_Target.Pde = g_Target.SavedPde;
-    }
-    SvFlushNestedTlbAllProcessors();
-
-    if (g_Target.SplitTable != nullptr)
-    {
-        SvFreePageAlingedPhysicalMemory(g_Target.SplitTable);
-        g_Target.SplitTable = nullptr;
-    }
-    if (g_Target.LockedMdl != nullptr)
-    {
-        MmUnlockPages(g_Target.LockedMdl);
-        IoFreeMdl(g_Target.LockedMdl);
-        g_Target.LockedMdl = nullptr;
-    }
-    g_Target.Pde = nullptr;
-
-    //
-    // (2) Move, step two: install the trap on the new GPA exactly as arm
-    // time does — its own 2MB region, its own split table and saved PDE.
+    // (2) Validate + allocate + fill the new split table BEFORE any teardown
+    // (review fixes 2 and 3): g_Target.SplitTable never becomes null while
+    // NptArmed is 1, and a failure here leaves the old trap fully armed.
     //
     pml4Index = static_cast<ULONG>((newGpa >> 39) & 0x1FF);
     if (pml4Index >= 2)
     {
         status = STATUS_NOT_SUPPORTED;
-        goto FailDisarmed;
+        goto Abort;                          // old trap still armed
     }
     pdptIndex = static_cast<ULONG>((newGpa >> 30) & 0x1FF);
     pdIndex = static_cast<ULONG>((newGpa >> 21) & 0x1FF);
@@ -1996,47 +2011,78 @@ SvRecheckNptTrap (
     if (newSplit == nullptr)
     {
         status = STATUS_INSUFFICIENT_RESOURCES;
-        goto FailDisarmed;
+        goto Abort;                          // old trap still armed
     }
 
     tree = &g_SharedVpData->Pml4eTrees[pml4Index];
-    pde = &tree->PdEntries[pdptIndex][pdIndex];
-
-    if (SvFillSplitTableFromPde(pde, newSplit) == FALSE)
+    newPde = &tree->PdEntries[pdptIndex][pdIndex];
+    if (SvFillSplitTableFromPde(newPde, newSplit) == FALSE)
     {
         status = STATUS_INVALID_PARAMETER;
-        goto FailDisarmed;
+        goto Abort;                          // old trap still armed
     }
     newSplit->Entries[ptIndex].Fields.NoExecute = 1;
 
+    ptPa = MmGetPhysicalAddress(newSplit);
+    newPdeValue.AsUInt64 = 0;
+    newPdeValue.Fields.Valid = 1;
+    newPdeValue.Fields.Write = 1;
+    newPdeValue.Fields.User = 1;
+    newPdeValue.Fields.PageFrameNumber =
+        static_cast<UINT64>(ptPa.QuadPart) >> PAGE_SHIFT;
+    newPdeValue.Fields.NoExecute = 0;
+
+    sameRegion = (newPde == g_Target.Pde);
+
     //
-    // Publish the moved state BEFORE repointing the PDE (same ordering rule
-    // as ARM: a #NPF on any core must find a consistent g_Target).
+    // (3) The swap. Capture the old state, publish the new state (the ARM
+    // ordering rule), then swap the PDEs with single 64-bit stores, flush,
+    // and release the old resources only after the flush.
     //
-    g_Target.SavedPde = *pde;
+    oldPde = g_Target.Pde;
+    oldSavedPde = g_Target.SavedPde;         // the old region's original PDE
+    oldSplit = g_Target.SplitTable;
+    oldMdl = g_Target.LockedMdl;
+
     g_Target.TargetGpa = newGpa;
     g_Target.PtIndex = ptIndex;
-    g_Target.Pde = pde;
-    g_Target.SplitTable = newSplit;
-    g_Target.LockedMdl = newMdl;
+    g_Target.Pde = newPde;
+    g_Target.SplitTable = newSplit;          // never null while NptArmed==1
+    g_Target.LockedMdl = newMdl;             // old MDL released below
+    if (!sameRegion)
+    {
+        g_Target.SavedPde = *newPde;         // the new region's original PDE
+    }
+    // sameRegion keeps the existing SavedPde (the original large-page PDE).
     g_Target.TargetCr3 = cr3;
     newMdl = nullptr;                        // ownership moved to g_Target
     KeMemoryBarrier();
 
-    //
-    // (3) Repoint the new region's PDE at the split table, then flush.
-    //
-    ptPa = MmGetPhysicalAddress(newSplit);
-    pdeAsTablePointer = reinterpret_cast<PPML4_ENTRY_2MB>(pde);
-    pdeAsTablePointer->AsUInt64 = 0;
-    pdeAsTablePointer->Fields.Valid = 1;
-    pdeAsTablePointer->Fields.Write = 1;
-    pdeAsTablePointer->Fields.User = 1;
-    pdeAsTablePointer->Fields.PageFrameNumber =
-        static_cast<UINT64>(ptPa.QuadPart) >> PAGE_SHIFT;
-    pdeAsTablePointer->Fields.NoExecute = 0;
-
+    newPdeAsTablePointer = reinterpret_cast<PPML4_ENTRY_2MB>(newPde);
+    newPdeAsTablePointer->AsUInt64 = newPdeValue.AsUInt64;
+    if (!sameRegion && oldPde != nullptr)
+    {
+        //
+        // Restore the old region's ORIGINAL PDE with a single store (it was
+        // a split-table pointer; putting the original large page back is
+        // exactly what disarm does).
+        //
+        *oldPde = oldSavedPde;
+    }
     SvFlushNestedTlbAllProcessors();
+
+    //
+    // The flush has retired every in-flight handler; free the old resources.
+    //
+    if (oldSplit != nullptr)
+    {
+        SvFreePageAlingedPhysicalMemory(oldSplit);
+    }
+    if (oldMdl != nullptr)
+    {
+        MmUnlockPages(oldMdl);
+        IoFreeMdl(oldMdl);
+    }
 
     Reply->NewGpa = newGpa;
     Reply->Changed = 1;
@@ -2048,34 +2094,25 @@ SvRecheckNptTrap (
 
 Abort:
     //
-    // Not moved: release the new pin (the old trap is untouched).
+    // Not moved: release the new pin (only if locked), free any new split,
+    // and return the STATUS (review fix 1).
     //
     if (newMdl != nullptr)
     {
-        MmUnlockPages(newMdl);
+        if (newLocked != FALSE)
+        {
+            MmUnlockPages(newMdl);
+        }
         IoFreeMdl(newMdl);
     }
-    InterlockedExchange(&g_RecheckBusy, 0);
-    return STATUS_SUCCESS;
-
-FailDisarmed:
-    //
-    // The old trap is retired and the new one could not be installed: finish
-    // a full disarm so no resource leaks and no half-armed state remains.
-    //
     if (newSplit != nullptr)
     {
         SvFreePageAlingedPhysicalMemory(newSplit);
     }
-    if (newMdl != nullptr)
-    {
-        MmUnlockPages(newMdl);
-        IoFreeMdl(newMdl);
-    }
     InterlockedExchange(&g_RecheckBusy, 0);
-    SvDisarmNptTrap();
     return status;
 }
+
 
 /*!
     @brief          Allocates the register-trace ring and enables capture.

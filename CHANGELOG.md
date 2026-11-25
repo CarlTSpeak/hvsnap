@@ -40,3 +40,19 @@ MmGetVirtualForPhysical, so a second COW move re-splits the same region
 without building leaves from a table pointer misread as a frame). Used by
 both ARM and RECHECK. Gap found by self-review during F's independent
 kernel-safety review; flagged to F before the review landed.
+
+**Review fixes (F's kernel-safety review of b738052 + 8403e90)**:
+(1) BLOCKING — RECHECK now tracks a `newLocked` flag: an MDL whose
+`MmProbeAndLockPages` raised is freed without unlocking (no bugcheck /
+refcount corruption when the target exits or unmaps between polls), and
+the error propagates instead of returning SUCCESS. (2) The new split
+table is allocated AND filled BEFORE any teardown, so `SplitTable` is
+never null while `NptArmed` is 1; the #DB handler null+arm checks before
+touching the table. (3) The >1 TB check and the table allocation moved
+before the swap — every failure path now leaves the old trap fully armed.
+(4) gpa comes from the locked MDL's PFN (`MmGetMdlPfnArray[0]`), not a
+second lookup — in both RECHECK and ARM. (5) PDE writes build the entry
+in a local and publish with ONE 64-bit store — no concurrent walk can
+observe a not-present or frame-0 PDE — in RECHECK and ARM. (8) hvctl
+surfaces RECHECK DeviceIoControl failures instead of silently reporting
+'no hit'. Non-blocking (6)/(7) accepted as-is per the review.
