@@ -1205,8 +1205,14 @@ SvHandleDebugException (
         // Completed one instruction. Re-arm the trap and stop single-stepping.
         // Review fix (2): the RECHECK move keeps SplitTable non-null, but a
         // disarm or a failed move can land here first — null/arm check
-        // before touching the table.
+        // before touching the table. Review-2 fix (3): clear our TF on the
+        // bail-out too (a stray single-step otherwise stays armed in the
+        // guest), and read the table through one local.
         //
+        if (g_StepState[processorIndex].GuestTfWasSet == FALSE)
+        {
+            VpData->GuestVmcb.StateSaveArea.Rflags &= ~static_cast<UINT64>(RFLAGS_TF);
+        }
         if (InterlockedCompareExchange(&g_Target.NptArmed, 1, 1) == 0 ||
             g_Target.SplitTable == nullptr)
         {
@@ -1214,10 +1220,10 @@ SvHandleDebugException (
             VpData->GuestVmcb.ControlArea.TlbControl = SVM_TLB_CONTROL_FLUSH_ALL;
             return;
         }
-        g_Target.SplitTable->Entries[g_Target.PtIndex].Fields.NoExecute = 1;
-        if (g_StepState[processorIndex].GuestTfWasSet == FALSE)
         {
-            VpData->GuestVmcb.StateSaveArea.Rflags &= ~static_cast<UINT64>(RFLAGS_TF);
+            PNESTED_PAGE_TABLE table = g_Target.SplitTable;
+            const ULONG leaf = g_Target.PtIndex;
+            table->Entries[leaf].Fields.NoExecute = 1;
         }
         g_StepState[processorIndex].Stepping = FALSE;
         VpData->GuestVmcb.ControlArea.TlbControl = SVM_TLB_CONTROL_FLUSH_ALL;
@@ -1441,37 +1447,28 @@ SvFillSplitTableFromPde (
     _Out_ PNESTED_PAGE_TABLE SplitTable
     )
 {
-    if (Pde->Fields.Valid == 0)
+    //
+    // Review-2 fix (1): fill ONLY from a 2MB large-page PDE. An already-split
+    // PDE is refused: reading a table pointer through the 2MB view names the
+    // wrong frame, and copying a live split table would carry the OLD NX
+    // leaf into the new table (the #NPF handler no longer knows that GPA —
+    // an old-frame fetch would bugcheck). Same-region RECHECK moves pass
+    // g_Target.SavedPde (the ORIGINAL large-page PDE) instead.
+    //
+    if (Pde->Fields.Valid == 0 || Pde->Fields.LargePage == 0)
     {
         return FALSE;
     }
-    if (Pde->Fields.LargePage != 0)
+    const UINT64 base4kFrame = static_cast<UINT64>(Pde->Fields.PageFrameNumber) << 9;
+    for (ULONG i = 0; i < 512; i++)
     {
-        const UINT64 base4kFrame = static_cast<UINT64>(Pde->Fields.PageFrameNumber) << 9;
-        for (ULONG i = 0; i < 512; i++)
-        {
-            SplitTable->Entries[i].AsUInt64 = 0;
-            SplitTable->Entries[i].Fields.Valid = 1;
-            SplitTable->Entries[i].Fields.Write = 1;
-            SplitTable->Entries[i].Fields.User = 1;
-            SplitTable->Entries[i].Fields.PageFrameNumber = base4kFrame + i;
-            SplitTable->Entries[i].Fields.NoExecute = 0;
-        }
-        return TRUE;
+        SplitTable->Entries[i].AsUInt64 = 0;
+        SplitTable->Entries[i].Fields.Valid = 1;
+        SplitTable->Entries[i].Fields.Write = 1;
+        SplitTable->Entries[i].Fields.User = 1;
+        SplitTable->Entries[i].Fields.PageFrameNumber = base4kFrame + i;
+        SplitTable->Entries[i].Fields.NoExecute = 0;
     }
-    //
-    // Already split: the PDE points at an existing 4KB table. Copy its
-    // leaves wholesale (the table is page-aligned; translate its PFN via
-    // MmGetVirtualForPhysical on the identity-mapped NPT allocation).
-    //
-    PHYSICAL_ADDRESS tablePa;
-    tablePa.QuadPart = static_cast<LONGLONG>(static_cast<UINT64>(Pde->Fields.PageFrameNumber) << PAGE_SHIFT);
-    const PVOID tableVa = MmGetVirtualForPhysical(tablePa);
-    if (tableVa == nullptr)
-    {
-        return FALSE;
-    }
-    RtlCopyMemory(SplitTable, tableVa, sizeof(NESTED_PAGE_TABLE));
     return TRUE;
 }
 
@@ -1709,7 +1706,8 @@ SvArmNptTrap (
             static_cast<UINT64>(ptPa.QuadPart) >> PAGE_SHIFT;
         pdeValue.Fields.NoExecute = 0;
         pdeAsTablePointer = reinterpret_cast<PPML4_ENTRY_2MB>(pde);
-        pdeAsTablePointer->AsUInt64 = pdeValue.AsUInt64;
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&pdeAsTablePointer->AsUInt64),
+                              static_cast<LONG64>(pdeValue.AsUInt64));
     }
 
     //
@@ -1911,6 +1909,7 @@ SvRecheckNptTrap (
     PML4_ENTRY_2MB newPdeValue;
     PHYSICAL_ADDRESS ptPa;
     BOOLEAN sameRegion;
+    PD_ENTRY_2MB newRegionOriginal;
 
     RtlZeroMemory(Reply, sizeof(*Reply));
     Reply->OldGpa = g_Target.TargetGpa;
@@ -1938,6 +1937,7 @@ SvRecheckNptTrap (
     newSplit = nullptr;
     newGpa = 0;
     cr3 = 0;
+    newRegionOriginal.AsUInt64 = 0;
 
     //
     // (1) Resolve and PIN the new frame first. The MDL's PFN is the trapped
@@ -2016,12 +2016,25 @@ SvRecheckNptTrap (
 
     tree = &g_SharedVpData->Pml4eTrees[pml4Index];
     newPde = &tree->PdEntries[pdptIndex][pdIndex];
-    if (SvFillSplitTableFromPde(newPde, newSplit) == FALSE)
+    sameRegion = (newPde == g_Target.Pde);
+    //
+    // Review-2 fix (1): a same-region move must fill from the ORIGINAL
+    // large-page PDE (g_Target.SavedPde) — the live PDE is our split
+    // pointer, which SvFillSplitTableFromPde now refuses. A cross-region
+    // move fills from the new region's untouched PDE (captured now, before
+    // any restore touches anything).
+    //
+    if (SvFillSplitTableFromPde(sameRegion ? &g_Target.SavedPde : newPde,
+                                newSplit) == FALSE)
     {
         status = STATUS_INVALID_PARAMETER;
         goto Abort;                          // old trap still armed
     }
     newSplit->Entries[ptIndex].Fields.NoExecute = 1;
+    if (!sameRegion)
+    {
+        newRegionOriginal = *newPde;         // the new region's original PDE
+    }
 
     ptPa = MmGetPhysicalAddress(newSplit);
     newPdeValue.AsUInt64 = 0;
@@ -2032,43 +2045,62 @@ SvRecheckNptTrap (
         static_cast<UINT64>(ptPa.QuadPart) >> PAGE_SHIFT;
     newPdeValue.Fields.NoExecute = 0;
 
-    sameRegion = (newPde == g_Target.Pde);
-
     //
-    // (3) The swap. Capture the old state, publish the new state (the ARM
-    // ordering rule), then swap the PDEs with single 64-bit stores, flush,
-    // and release the old resources only after the flush.
+    // (3) The swap — review-2 fix (2): retire the OLD leaf first (restore
+    // + flush), THEN publish the new state and repoint. While the old NX
+    // leaf is live, g_Target still describes it, so an old-frame fetch on
+    // another core matches TargetGpa and parks normally (no :1095
+    // bugcheck); after the restore+flush the old leaf is gone and the
+    // handler cannot see half-published state.
     //
     oldPde = g_Target.Pde;
     oldSavedPde = g_Target.SavedPde;         // the old region's original PDE
     oldSplit = g_Target.SplitTable;
     oldMdl = g_Target.LockedMdl;
 
-    g_Target.TargetGpa = newGpa;
-    g_Target.PtIndex = ptIndex;
-    g_Target.Pde = newPde;
-    g_Target.SplitTable = newSplit;          // never null while NptArmed==1
-    g_Target.LockedMdl = newMdl;             // old MDL released below
-    if (!sameRegion)
-    {
-        g_Target.SavedPde = *newPde;         // the new region's original PDE
-    }
-    // sameRegion keeps the existing SavedPde (the original large-page PDE).
-    g_Target.TargetCr3 = cr3;
-    newMdl = nullptr;                        // ownership moved to g_Target
-    KeMemoryBarrier();
-
-    newPdeAsTablePointer = reinterpret_cast<PPML4_ENTRY_2MB>(newPde);
-    newPdeAsTablePointer->AsUInt64 = newPdeValue.AsUInt64;
     if (!sameRegion && oldPde != nullptr)
     {
         //
-        // Restore the old region's ORIGINAL PDE with a single store (it was
-        // a split-table pointer; putting the original large page back is
-        // exactly what disarm does).
+        // Cross-region: restore the old region's ORIGINAL PDE (single
+        // store, exactly what disarm does) and flush — the old leaf dies
+        // here, before any state moves.
         //
-        *oldPde = oldSavedPde;
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&oldPde->AsUInt64),
+                              static_cast<LONG64>(oldSavedPde.AsUInt64));
+        SvFlushNestedTlbAllProcessors();
     }
+    else if (sameRegion)
+    {
+        //
+        // Same region: restore the ORIGINAL large page (killing the old
+        // split + NX leaf), flush, then repoint at the new table below.
+        //
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&oldPde->AsUInt64),
+                              static_cast<LONG64>(oldSavedPde.AsUInt64));
+        SvFlushNestedTlbAllProcessors();
+    }
+
+    //
+    // Publish the new state (the ARM ordering rule: a #NPF on the new leaf
+    // must find a consistent g_Target), then repoint with a single store.
+    //
+    g_Target.TargetGpa = newGpa;
+    g_Target.PtIndex = ptIndex;
+    g_Target.Pde = newPde;
+    g_Target.SplitTable = newSplit;
+    g_Target.LockedMdl = newMdl;
+    if (!sameRegion)
+    {
+        g_Target.SavedPde = newRegionOriginal; // captured before the restore
+    }
+    // sameRegion keeps the existing SavedPde (the original large-page PDE).
+    g_Target.TargetCr3 = cr3;
+    newMdl = nullptr;                          // ownership moved to g_Target
+    KeMemoryBarrier();
+
+    newPdeAsTablePointer = reinterpret_cast<PPML4_ENTRY_2MB>(newPde);
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&newPdeAsTablePointer->AsUInt64),
+                          static_cast<LONG64>(newPdeValue.AsUInt64));
     SvFlushNestedTlbAllProcessors();
 
     //

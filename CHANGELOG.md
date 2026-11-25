@@ -56,3 +56,22 @@ in a local and publish with ONE 64-bit store — no concurrent walk can
 observe a not-present or frame-0 PDE — in RECHECK and ARM. (8) hvctl
 surfaces RECHECK DeviceIoControl failures instead of silently reporting
 'no hit'. Non-blocking (6)/(7) accepted as-is per the review.
+
+**Review-2 fixes** (second kernel-safety review):
+(1) BLOCKING — `SvFillSplitTableFromPde` now fills ONLY from a 2MB
+large-page PDE and refuses anything else (the already-split copy path
+misread a table pointer through the 2MB view — wrong frame, unchecked
+copy, and it would have carried the OLD NX leaf into the new table,
+bugchecking the #NPF handler). A same-region RECHECK move fills from
+`g_Target.SavedPde` (the original large page) instead; the copy and
+`MmGetVirtualForPhysical` are gone.
+(2) BLOCKING — the swap retires the OLD leaf FIRST (restore original PDE
++ flush) and only then publishes the new state and repoints, so an
+old-frame fetch on another core always matches the still-live
+`TargetGpa` (no :1095 bugcheck window, no half-published handler state).
+(3) The #DB handler clears our TF on the bail-out path too and reads
+the table through one local.
+(4) All three PDE publications are `InterlockedExchange64` stores (the
+single 64-bit write is guaranteed by the language, not just by intent).
+(5) hvctl stops RECHECK polling after the first failure (a target that
+exits would otherwise print the error every 250 ms).

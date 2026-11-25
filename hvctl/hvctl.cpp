@@ -787,17 +787,23 @@ int wmain(int argc, wchar_t** argv)
                 HVSNAP_RECHECK_REPLY rcp{};
                 // Review fix (8): surface RECHECK failures instead of
                 // silently reporting 'no hit' after a failed move.
+                // Review-2 fix (5): stop polling after the first failure
+                // (once the target exits the call errors every 250 ms).
                 if (!DeviceIoControl(dev, HVSNAP_IOCTL_RECHECK, nullptr, 0, &rcp, sizeof(rcp), &ret, nullptr))
                 {
-                    wprintf(L"[!] RECHECK failed (err %lu); the VA trap may be stale or disarmed.\n",
+                    wprintf(L"[!] RECHECK failed (err %lu); the VA trap may be stale or disarmed. Polling stopped.\n",
                             GetLastError());
+                    opt.RecheckMs = 0;
                 }
                 else if (rcp.Changed != 0)
                 {
                     wprintf(L"[*] RECHECK: moved the VA trap after a frame change (COW): old GPA 0x%llx -> new GPA 0x%llx\n",
                             rcp.OldGpa, rcp.NewGpa);
                 }
-                nextRecheck = GetTickCount() + opt.RecheckMs;
+                if (opt.RecheckMs != 0)
+                {
+                    nextRecheck = GetTickCount() + opt.RecheckMs;
+                }
             }
             Sleep(2);
         }
