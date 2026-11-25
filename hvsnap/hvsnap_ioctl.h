@@ -42,6 +42,24 @@
 #define HVSNAP_IOCTL_TRACE_DRAIN CTL_CODE(FILE_DEVICE_UNKNOWN, 0x804, METHOD_BUFFERED, FILE_ANY_ACCESS)
 // Stop tracing and free the ring (call after DISARM + a final drain).
 #define HVSNAP_IOCTL_TRACE_STOP  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x805, METHOD_BUFFERED, FILE_ANY_ACCESS)
+// Re-resolve the trapped VA and MOVE the NPT execute-trap if its backing
+// guest-physical frame changed (copy-on-write after in-place unpacking).
+// No input; writes HVSNAP_RECHECK_REPLY. Safe to poll while waiting for a
+// hit; a no-op when the frame is unchanged or the target already parked.
+#define HVSNAP_IOCTL_RECHECK     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x806, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+//
+// Reply of HVSNAP_IOCTL_RECHECK. Changed is 0 when nothing moved (same
+// frame, not armed, or the target already parked); OldGpa/NewGpa are
+// page-aligned guest-physical addresses for diagnostics.
+//
+typedef struct _HVSNAP_RECHECK_REPLY
+{
+    unsigned __int64 OldGpa;
+    unsigned __int64 NewGpa;
+    unsigned __int32 Changed;
+    unsigned __int32 Reserved;
+} HVSNAP_RECHECK_REPLY, *PHVSNAP_RECHECK_REPLY;
 
 //
 // One captured register sample (feature: register trace). Fixed 192-byte layout,

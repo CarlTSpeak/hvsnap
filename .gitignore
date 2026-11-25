@@ -1,0 +1,7 @@
+# Build outputs and pinned binaries stay out of Git
+x64/
+hvsnap/x64/
+*.obj
+hvctl/hvctl.exe
+pin-current/
+v3-test/out/
