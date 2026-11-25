@@ -523,6 +523,11 @@ typedef struct _HVSNAP_TARGET
 static HVSNAP_TARGET g_Target;
 
 //
+// RECHECK serialization (Stage A VA-trap fix): one re-resolve at a time.
+//
+static volatile LONG g_RecheckBusy = 0;
+
+//
 // Register-trace ring (feature: register trace). When Enabled, the #NPF handler
 // captures a record per matching hit into Ring[WriteIndex % Capacity] and keeps
 // running (no freeze). WriteIndex is a lock-free multi-producer reservation
@@ -1772,6 +1777,266 @@ SvDisarmNptTrap (
     g_Target.Pde = nullptr;
 
     SvDebugPrint("DISARM NPT\n");
+}
+
+/*!
+    @brief          Re-resolves the trapped VA and MOVES the NPT execute-trap.
+
+    @details        Stage A of the VA-trap fix (Z, 2026-11-25): an ARM-time
+                    translation goes stale when the loader copy-on-writes the
+                    RWX image page (in-place unpacking/decryption), leaving the
+                    NX leaf guarding a frame nobody executes. RECHECK resolves
+                    the target VA again; when the backing guest-physical frame
+                    changed it MOVES the trap — never repoints a live leaf's
+                    PFN (that would alias every old-GPA access onto the new
+                    frame): (1) restore the old 2MB PDE + nested-TLB flush,
+                    free the old split table, unlock the old MDL; (2) pin the
+                    new frame and install a fresh split table + NX leaf for
+                    the new GPA (its own 2MB region and saved PDE); (3) flush.
+                    NptArmed stays 1 across the move so an in-flight #NPF
+                    handler always sees a valid g_Target; the PDE-restore
+                    flush retires any in-flight handler before resources are
+                    freed (the disarm discipline).
+
+                    No-op success (Changed=0) when the frame is unchanged, the
+                    trap is not armed, or the target already parked. Serialized
+                    against concurrent RECHECKs with a busy flag.
+
+    @param[out]     Reply - old/new GPAs and Changed (always filled).
+
+    @result         STATUS_SUCCESS (see Changed), or an error. On a mid-move
+                    failure the trap is fully disarmed (safe state), never
+                    half-armed.
+*/
+_IRQL_requires_max_(PASSIVE_LEVEL)
+static
+NTSTATUS
+SvRecheckNptTrap (
+    _Out_ PHVSNAP_RECHECK_REPLY Reply
+    )
+{
+    NTSTATUS status;
+    KAPC_STATE apcState;
+    BOOLEAN attached;
+    PMDL newMdl;
+    PHYSICAL_ADDRESS newPa;
+    UINT64 newGpa;
+    UINT64 cr3;
+    PNESTED_PAGE_TABLE newSplit;
+    PPD_ENTRY_2MB pde;
+    PPML4_ENTRY_2MB pdeAsTablePointer;
+    PPML4E_TREE tree;
+    PHYSICAL_ADDRESS ptPa;
+    ULONG pml4Index, pdptIndex, pdIndex, ptIndex;
+    UINT64 base4kFrame;
+
+    RtlZeroMemory(Reply, sizeof(*Reply));
+    Reply->OldGpa = g_Target.TargetGpa;
+
+    if (g_SharedVpData == nullptr)
+    {
+        return STATUS_DEVICE_NOT_READY;
+    }
+    if (InterlockedCompareExchange(&g_Target.NptArmed, 1, 1) == 0)
+    {
+        return STATUS_SUCCESS;              // not armed: nothing to re-resolve
+    }
+    if (InterlockedCompareExchange(&g_Target.Hit, 1, 1) != 0)
+    {
+        return STATUS_SUCCESS;              // already parked: leave it alone
+    }
+    if (InterlockedCompareExchange(&g_RecheckBusy, 1, 0) != 0)
+    {
+        return STATUS_DEVICE_BUSY;
+    }
+
+    attached = FALSE;
+    newMdl = nullptr;
+    newSplit = nullptr;
+    cr3 = 0;
+    newPa.QuadPart = 0;
+
+    //
+    // Resolve the CURRENT translation and pin the new frame BEFORE touching
+    // the old trap: a pin failure then aborts with the old trap still armed.
+    //
+    KeStackAttachProcess(g_Target.TargetProcess, &apcState);
+    attached = TRUE;
+    __try
+    {
+        cr3 = __readcr3();
+        newMdl = IoAllocateMdl(reinterpret_cast<PVOID>(g_Target.TargetRip & ~(static_cast<UINT64>(PAGE_SIZE) - 1)),
+                               PAGE_SIZE, FALSE, FALSE, nullptr);
+        if (newMdl == nullptr)
+        {
+            status = STATUS_INSUFFICIENT_RESOURCES;
+            __leave;
+        }
+        MmProbeAndLockPages(newMdl, UserMode, IoReadAccess);
+        newPa = MmGetPhysicalAddress(reinterpret_cast<PVOID>(g_Target.TargetRip));
+        if (newPa.QuadPart == 0)
+        {
+            status = STATUS_UNSUCCESSFUL;
+            __leave;
+        }
+        status = STATUS_SUCCESS;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        status = GetExceptionCode();
+    }
+    KeUnstackDetachProcess(&apcState);
+    attached = FALSE;
+
+    if (!NT_SUCCESS(status))
+    {
+        goto Abort;                          // old trap still armed, unchanged
+    }
+
+    newGpa = static_cast<UINT64>(newPa.QuadPart) & ~(static_cast<UINT64>(PAGE_SIZE) - 1);
+    if (newGpa == g_Target.TargetGpa)
+    {
+        Reply->NewGpa = newGpa;
+        goto Abort;                          // unchanged: release the new pin
+    }
+
+    //
+    // A park may have raced in while we resolved; re-check before tearing
+    // the old leaf down (a parked target must not be disturbed).
+    //
+    if (InterlockedCompareExchange(&g_Target.Hit, 1, 1) != 0)
+    {
+        Reply->NewGpa = newGpa;
+        goto Abort;
+    }
+
+    //
+    // (1) Move, step one: retire the old leaf. Restore the saved 2MB PDE and
+    // flush — the flush retires any in-flight #NPF handler before we free
+    // the split table. NptArmed stays 1 throughout (handler validity).
+    //
+    if (g_Target.Pde != nullptr)
+    {
+        *g_Target.Pde = g_Target.SavedPde;
+    }
+    SvFlushNestedTlbAllProcessors();
+
+    if (g_Target.SplitTable != nullptr)
+    {
+        SvFreePageAlingedPhysicalMemory(g_Target.SplitTable);
+        g_Target.SplitTable = nullptr;
+    }
+    if (g_Target.LockedMdl != nullptr)
+    {
+        MmUnlockPages(g_Target.LockedMdl);
+        IoFreeMdl(g_Target.LockedMdl);
+        g_Target.LockedMdl = nullptr;
+    }
+    g_Target.Pde = nullptr;
+
+    //
+    // (2) Move, step two: install the trap on the new GPA exactly as arm
+    // time does — its own 2MB region, its own split table and saved PDE.
+    //
+    pml4Index = static_cast<ULONG>((newGpa >> 39) & 0x1FF);
+    if (pml4Index >= 2)
+    {
+        status = STATUS_NOT_SUPPORTED;
+        goto FailDisarmed;
+    }
+    pdptIndex = static_cast<ULONG>((newGpa >> 30) & 0x1FF);
+    pdIndex = static_cast<ULONG>((newGpa >> 21) & 0x1FF);
+    ptIndex = static_cast<ULONG>((newGpa >> 12) & 0x1FF);
+
+    newSplit = static_cast<PNESTED_PAGE_TABLE>(
+        SvAllocatePageAlingedPhysicalMemory(sizeof(NESTED_PAGE_TABLE)));
+    if (newSplit == nullptr)
+    {
+        status = STATUS_INSUFFICIENT_RESOURCES;
+        goto FailDisarmed;
+    }
+
+    tree = &g_SharedVpData->Pml4eTrees[pml4Index];
+    pde = &tree->PdEntries[pdptIndex][pdIndex];
+
+    base4kFrame = static_cast<UINT64>(pde->Fields.PageFrameNumber) << 9;
+    for (ULONG i = 0; i < 512; i++)
+    {
+        newSplit->Entries[i].AsUInt64 = 0;
+        newSplit->Entries[i].Fields.Valid = 1;
+        newSplit->Entries[i].Fields.Write = 1;
+        newSplit->Entries[i].Fields.User = 1;
+        newSplit->Entries[i].Fields.PageFrameNumber = base4kFrame + i;
+        newSplit->Entries[i].Fields.NoExecute = 0;
+    }
+    newSplit->Entries[ptIndex].Fields.NoExecute = 1;
+
+    //
+    // Publish the moved state BEFORE repointing the PDE (same ordering rule
+    // as ARM: a #NPF on any core must find a consistent g_Target).
+    //
+    g_Target.SavedPde = *pde;
+    g_Target.TargetGpa = newGpa;
+    g_Target.PtIndex = ptIndex;
+    g_Target.Pde = pde;
+    g_Target.SplitTable = newSplit;
+    g_Target.LockedMdl = newMdl;
+    g_Target.TargetCr3 = cr3;
+    newMdl = nullptr;                        // ownership moved to g_Target
+    KeMemoryBarrier();
+
+    //
+    // (3) Repoint the new region's PDE at the split table, then flush.
+    //
+    ptPa = MmGetPhysicalAddress(newSplit);
+    pdeAsTablePointer = reinterpret_cast<PPML4_ENTRY_2MB>(pde);
+    pdeAsTablePointer->AsUInt64 = 0;
+    pdeAsTablePointer->Fields.Valid = 1;
+    pdeAsTablePointer->Fields.Write = 1;
+    pdeAsTablePointer->Fields.User = 1;
+    pdeAsTablePointer->Fields.PageFrameNumber =
+        static_cast<UINT64>(ptPa.QuadPart) >> PAGE_SHIFT;
+    pdeAsTablePointer->Fields.NoExecute = 0;
+
+    SvFlushNestedTlbAllProcessors();
+
+    Reply->NewGpa = newGpa;
+    Reply->Changed = 1;
+
+    SvDebugPrint("RECHECK NPT: MOVED rip=0x%llx oldGpa=0x%llx newGpa=0x%llx cr3=0x%llx\n",
+                 g_Target.TargetRip, Reply->OldGpa, newGpa, cr3);
+    InterlockedExchange(&g_RecheckBusy, 0);
+    return STATUS_SUCCESS;
+
+Abort:
+    //
+    // Not moved: release the new pin (the old trap is untouched).
+    //
+    if (newMdl != nullptr)
+    {
+        MmUnlockPages(newMdl);
+        IoFreeMdl(newMdl);
+    }
+    InterlockedExchange(&g_RecheckBusy, 0);
+    return STATUS_SUCCESS;
+
+FailDisarmed:
+    //
+    // The old trap is retired and the new one could not be installed: finish
+    // a full disarm so no resource leaks and no half-armed state remains.
+    //
+    if (newSplit != nullptr)
+    {
+        SvFreePageAlingedPhysicalMemory(newSplit);
+    }
+    if (newMdl != nullptr)
+    {
+        MmUnlockPages(newMdl);
+        IoFreeMdl(newMdl);
+    }
+    InterlockedExchange(&g_RecheckBusy, 0);
+    SvDisarmNptTrap();
+    return status;
 }
 
 /*!
@@ -3447,6 +3712,20 @@ SvDispatchDeviceControl (
     case HVSNAP_IOCTL_TRACE_STOP:
         SvTraceStop();
         status = STATUS_SUCCESS;
+        break;
+
+    case HVSNAP_IOCTL_RECHECK:
+        if (outLength >= sizeof(HVSNAP_RECHECK_REPLY))
+        {
+            PHVSNAP_RECHECK_REPLY reply =
+                static_cast<PHVSNAP_RECHECK_REPLY>(Irp->AssociatedIrp.SystemBuffer);
+            status = SvRecheckNptTrap(reply);
+            information = sizeof(HVSNAP_RECHECK_REPLY);
+        }
+        else
+        {
+            status = STATUS_BUFFER_TOO_SMALL;
+        }
         break;
 
     case HVSNAP_IOCTL_QUERY:

@@ -76,6 +76,7 @@ struct Options
     unsigned long long HitSkip = 0;
     std::wstring WhenText;       // original expression, for display
     bool Cloak = false;          // hide the freeze gap from the target's RDTSC/RDTSCP
+    unsigned RecheckMs = 250;    // poll RECHECK (move the VA trap after COW) every N ms; 0 = off
     bool KeepFrozen = false;     // (snapshot) stay frozen after the dump instead of auto-thawing
     bool TerminateAfter = false; // (snapshot/freeze) terminate the target after the clean thaw
     bool Handoff = false;        // (snapshot) after the dump, hand off to a debugger at the RIP
@@ -391,6 +392,7 @@ int wmain(int argc, wchar_t** argv)
         else if (a == L"--rip" && next(&v)) { opt.Rip = ParseHex(v); opt.HaveRip = true; }
         else if (a == L"--offset" && next(&v)) { opt.Offset = ParseHex(v); opt.HaveOffset = true; }
         else if (a == L"--timeout" && next(&v)) { opt.TimeoutSec = static_cast<unsigned>(wcstoul(v, nullptr, 0)); }
+        else if (a == L"--recheck-ms" && next(&v)) { opt.RecheckMs = static_cast<unsigned>(wcstoul(v, nullptr, 0)); }
         else if (a == L"--out" && next(&v)) { opt.OutDir = v; }
         else if (a == L"--prefix" && next(&v)) { opt.Prefix = v; }
         else if (a == L"--hold" && next(&v)) { opt.HoldSec = (int)wcstol(v, nullptr, 0); }
@@ -721,6 +723,7 @@ int wmain(int argc, wchar_t** argv)
         DWORD ret = 0;
         const DWORD deadline = GetTickCount() + opt.TimeoutSec * 1000;
         bool hit = false;
+        DWORD nextRecheck = GetTickCount();
         while (GetTickCount() < deadline)
         {
             if (DeviceIoControl(dev, HVSNAP_IOCTL_QUERY, nullptr, 0, &st, sizeof(st), &ret, nullptr) &&
@@ -779,7 +782,47 @@ int wmain(int argc, wchar_t** argv)
                 }
                 break;
             }
+            if (opt.RecheckMs != 0 && GetTickCount() >= nextRecheck)
+            {
+                HVSNAP_RECHECK_REPLY rcp{};
+                if (DeviceIoControl(dev, HVSNAP_IOCTL_RECHECK, nullptr, 0, &rcp, sizeof(rcp), &ret, nullptr) &&
+                    rcp.Changed != 0)
+                {
+                    wprintf(L"[*] RECHECK: moved the VA trap after a frame change (COW): old GPA 0x%llx -> new GPA 0x%llx\n",
+                            rcp.OldGpa, rcp.NewGpa);
+                }
+                nextRecheck = GetTickCount() + opt.RecheckMs;
+            }
             Sleep(2);
+        }
+        if (!hit && opt.RecheckMs != 0)
+        {
+            // Re-resolve once more before declaring no-hit: a COW that moved the
+            // frame between the last poll and the deadline is caught here.
+            HVSNAP_STATE probe{};
+            if (DeviceIoControl(dev, HVSNAP_IOCTL_QUERY, nullptr, 0, &probe, sizeof(probe), &ret, nullptr) &&
+                probe.Hit != 0)
+            {
+                st = probe;
+                hit = true;
+            }
+            else
+            {
+                HVSNAP_RECHECK_REPLY rcf{};
+                if (DeviceIoControl(dev, HVSNAP_IOCTL_RECHECK, nullptr, 0, &rcf, sizeof(rcf), &ret, nullptr) &&
+                    rcf.Changed != 0)
+                {
+                    wprintf(L"[*] RECHECK (final): moved the VA trap (old GPA 0x%llx -> new GPA 0x%llx); waiting one more second\n",
+                            rcf.OldGpa, rcf.NewGpa);
+                    const DWORD graceDeadline = GetTickCount() + 1000;
+                    while (GetTickCount() < graceDeadline)
+                    {
+                        if (DeviceIoControl(dev, HVSNAP_IOCTL_QUERY, nullptr, 0, &st, sizeof(st), &ret, nullptr) && st.Hit != 0)
+                        { hit = true; break; }
+                        Sleep(2);
+                    }
+                }
+            }
         }
         if (!hit)
         {
