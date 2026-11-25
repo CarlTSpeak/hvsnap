@@ -1415,6 +1415,57 @@ SvHandleRdtsc (
 }
 
 /*!
+    @brief          Fills a fresh 4KB split table for a 2MB NPT region.
+
+    @details        Handles BOTH shapes of the current PDE: a 2MB large
+                    page (identity base = PFN << 9) and an ALREADY-SPLIT
+                    table pointer (the existing 512 leaves are copied, so
+                    a re-split after a RECHECK move keeps every leaf; only
+                    the target leaf is re-NXed). Returns FALSE when the PDE
+                    is neither (invalid region state).
+*/
+static
+BOOLEAN
+SvFillSplitTableFromPde (
+    _In_ PPD_ENTRY_2MB Pde,
+    _Out_ PNESTED_PAGE_TABLE SplitTable
+    )
+{
+    if (Pde->Fields.Valid == 0)
+    {
+        return FALSE;
+    }
+    if (Pde->Fields.LargePage != 0)
+    {
+        const UINT64 base4kFrame = static_cast<UINT64>(Pde->Fields.PageFrameNumber) << 9;
+        for (ULONG i = 0; i < 512; i++)
+        {
+            SplitTable->Entries[i].AsUInt64 = 0;
+            SplitTable->Entries[i].Fields.Valid = 1;
+            SplitTable->Entries[i].Fields.Write = 1;
+            SplitTable->Entries[i].Fields.User = 1;
+            SplitTable->Entries[i].Fields.PageFrameNumber = base4kFrame + i;
+            SplitTable->Entries[i].Fields.NoExecute = 0;
+        }
+        return TRUE;
+    }
+    //
+    // Already split: the PDE points at an existing 4KB table. Copy its
+    // leaves wholesale (the table is page-aligned; translate its PFN via
+    // MmGetVirtualForPhysical on the identity-mapped NPT allocation).
+    //
+    PHYSICAL_ADDRESS tablePa;
+    tablePa.QuadPart = static_cast<LONGLONG>(static_cast<UINT64>(Pde->Fields.PageFrameNumber) << PAGE_SHIFT);
+    const PVOID tableVa = MmGetVirtualForPhysical(tablePa);
+    if (tableVa == nullptr)
+    {
+        return FALSE;
+    }
+    RtlCopyMemory(SplitTable, tableVa, sizeof(NESTED_PAGE_TABLE));
+    return TRUE;
+}
+
+/*!
     @brief          Installs the NPT execute-trap for the target page.
 
     @details        Resolves the target's guest-physical page (by attaching to
@@ -1454,7 +1505,6 @@ SvArmNptTrap (
     UINT64 cr3;
     UINT64 gpa;
     ULONG pml4Index, pdptIndex, pdIndex, ptIndex;
-    UINT64 base4kFrame;
     PPML4E_TREE tree;
     PPD_ENTRY_2MB pde;
     PPML4_ENTRY_2MB pdeAsTablePointer;
@@ -1550,19 +1600,13 @@ SvArmNptTrap (
     pde = &tree->PdEntries[pdptIndex][pdIndex];
 
     //
-    // Fill 512 identity leaf PTEs for the 2MB region, then arm the target leaf.
-    // The 2MB PDE's PageFrameNumber is a 2MB frame; its first 4KB frame is that
-    // value << 9 (2MB / 4KB == 512).
+    // Fill 512 identity leaf PTEs for the 2MB region (large page or an
+    // already-split table), then arm the target leaf.
     //
-    base4kFrame = static_cast<UINT64>(pde->Fields.PageFrameNumber) << 9;
-    for (ULONG i = 0; i < 512; i++)
+    if (SvFillSplitTableFromPde(pde, splitTable) == FALSE)
     {
-        splitTable->Entries[i].AsUInt64 = 0;
-        splitTable->Entries[i].Fields.Valid = 1;
-        splitTable->Entries[i].Fields.Write = 1;
-        splitTable->Entries[i].Fields.User = 1;
-        splitTable->Entries[i].Fields.PageFrameNumber = base4kFrame + i;
-        splitTable->Entries[i].Fields.NoExecute = 0;
+        status = STATUS_INVALID_PARAMETER;
+        goto Failure;
     }
     splitTable->Entries[ptIndex].Fields.NoExecute = 1;
 
@@ -1828,7 +1872,6 @@ SvRecheckNptTrap (
     PPML4E_TREE tree;
     PHYSICAL_ADDRESS ptPa;
     ULONG pml4Index, pdptIndex, pdIndex, ptIndex;
-    UINT64 base4kFrame;
 
     RtlZeroMemory(Reply, sizeof(*Reply));
     Reply->OldGpa = g_Target.TargetGpa;
@@ -1959,15 +2002,10 @@ SvRecheckNptTrap (
     tree = &g_SharedVpData->Pml4eTrees[pml4Index];
     pde = &tree->PdEntries[pdptIndex][pdIndex];
 
-    base4kFrame = static_cast<UINT64>(pde->Fields.PageFrameNumber) << 9;
-    for (ULONG i = 0; i < 512; i++)
+    if (SvFillSplitTableFromPde(pde, newSplit) == FALSE)
     {
-        newSplit->Entries[i].AsUInt64 = 0;
-        newSplit->Entries[i].Fields.Valid = 1;
-        newSplit->Entries[i].Fields.Write = 1;
-        newSplit->Entries[i].Fields.User = 1;
-        newSplit->Entries[i].Fields.PageFrameNumber = base4kFrame + i;
-        newSplit->Entries[i].Fields.NoExecute = 0;
+        status = STATUS_INVALID_PARAMETER;
+        goto FailDisarmed;
     }
     newSplit->Entries[ptIndex].Fields.NoExecute = 1;
 

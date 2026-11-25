@@ -32,3 +32,11 @@ the fix). No record-format or output change.
 chain so the move is event-driven instead of polled) and the on-machine
 regression (load window required; regression cases 0x142b16d78 and
 0x142b6ceaa must fire from --launch, untouched-page traps unchanged).
+
+**Re-split fix (pre-review, same branch)**: `SvFillSplitTableFromPde` — the
+identity-fill now handles BOTH PDE shapes: a 2MB large page (base = PFN<<9)
+and an ALREADY-SPLIT table pointer (the existing 512 leaves are copied via
+MmGetVirtualForPhysical, so a second COW move re-splits the same region
+without building leaves from a table pointer misread as a frame). Used by
+both ARM and RECHECK. Gap found by self-review during F's independent
+kernel-safety review; flagged to F before the review landed.
